@@ -1,0 +1,6 @@
+{
+  "name": "Elkwire",
+  "description": "Advanced Unmanned Systems and Defense Technology",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
