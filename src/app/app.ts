@@ -44,12 +44,12 @@ export class App implements AfterViewInit, OnDestroy {
   private orographicBarriers: { points: { x: number, y: number }[], strength: number }[] = [];
   private mapCache: HTMLCanvasElement | null = null;
   private mapCacheDirty = true;
-  // Pre-computed terrain deflection field (orographic + coastline)
   private terrainFieldU: Float32Array = new Float32Array(0);
   private terrainFieldV: Float32Array = new Float32Array(0);
   private tfCols = 0;
   private tfRows = 0;
   private tfCellSize = 20;
+  private isTouchDevice = false;
 
   // Real-world mountain range data: [lon, lat] polylines with relative strength
   // Strength represents barrier height/effectiveness (1.0 = Himalayas-class)
@@ -99,6 +99,7 @@ export class App implements AfterViewInit, OnDestroy {
   constructor(private ngZone: NgZone) {}
 
   ngAfterViewInit() {
+    this.isTouchDevice = 'ontouchstart' in window || navigator.maxTouchPoints > 0;
     this.fetchRealtimeWinds();
     this.windRefreshTimer = setInterval(() => this.fetchRealtimeWinds(), 15 * 60 * 1000);
     this.initCanvas();
@@ -487,11 +488,7 @@ export class App implements AfterViewInit, OnDestroy {
     this.ctx.fillStyle = 'rgba(0, 12, 24, 0.08)';
     this.ctx.fillRect(0, 0, this.width, this.height);
 
-    // Animate map opacity
-    const targetOpacity = this.mapVisible ? 1 : 0;
-    this.mapOpacity += (targetOpacity - this.mapOpacity) * 0.03;
-
-    // Draw cached map overlay and detailed outlines UNDER particles
+    // Draw dark continent silhouettes from cached offscreen canvas
     this.drawContinents();
 
     const t = performance.now() * 0.00005;
@@ -539,13 +536,9 @@ export class App implements AfterViewInit, OnDestroy {
       }
     }
 
-    // Draw mountain glow OVER particles
-    if (this.mapOpacity > 0.01) {
-      this.drawMountainGlow();
-    }
 
-    // Draw Military/Sonar Cursor Reticle
-    if (this.mouse.x > -500) {
+    // Draw Cursor Reticle (desktop only)
+    if (!this.isTouchDevice && this.mouse.x > -500) {
       this.ctx.strokeStyle = 'rgba(100, 160, 200, 0.2)';
       this.ctx.lineWidth = 1;
       this.ctx.beginPath();
@@ -733,50 +726,12 @@ export class App implements AfterViewInit, OnDestroy {
   }
 
   private drawContinents() {
+    // Always draw the ultra-subtle dark continent silhouettes from cache
     if (this.mapCacheDirty) {
       this.updateMapCache();
     }
-    
     if (this.mapCache) {
       this.ctx.drawImage(this.mapCache, 0, 0);
-    }
-    
-    const alpha = this.mapOpacity;
-    if (alpha > 0.01) {
-      const ctx = this.ctx;
-      
-      ctx.save();
-      ctx.shadowColor = `rgba(40, 160, 120, ${0.25 * alpha})`;
-      ctx.shadowBlur = 6;
-      ctx.strokeStyle = `rgba(30, 110, 80, ${0.4 * alpha})`;
-      ctx.lineWidth = 1;
-      for (const path of this.continentPaths) {
-        if (path.length < 3) continue;
-        ctx.beginPath();
-        ctx.moveTo(path[0].x, path[0].y);
-        for (let i = 1; i < path.length; i++) {
-          ctx.lineTo(path[i].x, path[i].y);
-        }
-        ctx.closePath();
-        ctx.stroke();
-      }
-      ctx.restore();
-
-      ctx.save();
-      ctx.shadowColor = `rgba(90, 170, 130, ${0.2 * alpha})`;
-      ctx.shadowBlur = 5;
-      for (const barrier of this.orographicBarriers) {
-        if (barrier.points.length < 2) continue;
-        ctx.beginPath();
-        ctx.moveTo(barrier.points[0].x, barrier.points[0].y);
-        for (let i = 1; i < barrier.points.length; i++) {
-          ctx.lineTo(barrier.points[i].x, barrier.points[i].y);
-        }
-        ctx.strokeStyle = `rgba(60, 130, 100, ${0.25 * barrier.strength * alpha})`;
-        ctx.lineWidth = 1 + barrier.strength;
-        ctx.stroke();
-      }
-      ctx.restore();
     }
   }
 
