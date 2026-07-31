@@ -41,14 +41,69 @@ export class App implements AfterViewInit, OnDestroy {
   private pressureGrid: number[][] = [];
   private dataReady = false;
   private deflectionPaths: { x: number, y: number }[][] = [];
+  private orographicBarriers: { points: { x: number, y: number }[], strength: number }[] = [];
+  private mapCache: HTMLCanvasElement | null = null;
+  private mapCacheDirty = true;
+  // Pre-computed terrain deflection field (orographic + coastline)
+  private terrainFieldU: Float32Array = new Float32Array(0);
+  private terrainFieldV: Float32Array = new Float32Array(0);
+  private tfCols = 0;
+  private tfRows = 0;
+  private tfCellSize = 20;
+
+  // Real-world mountain range data: [lon, lat] polylines with relative strength
+  // Strength represents barrier height/effectiveness (1.0 = Himalayas-class)
+  private static readonly MOUNTAIN_DATA: { coords: number[][], strength: number }[] = [
+    // HIMALAYAS - highest, strongest wind barrier on Earth
+    { coords: [[72,37],[74,36],[76,35],[78,34],[80,32],[82,30],[84,29],[86,28],[88,27],[90,28],[92,27],[95,28],[97,27],[100,26]], strength: 1.0 },
+    // KARAKORAM / HINDU KUSH
+    { coords: [[67,36],[69,36],[71,37],[73,37],[75,36],[77,36]], strength: 0.85 },
+    // WESTERN GHATS (India) - blocks SW monsoon
+    { coords: [[73,21],[73.5,19],[74,17],[75,15],[75.5,13],[76,11],[77,9]], strength: 0.5 },
+    // ANDES - longest continental mountain range
+    { coords: [[-75,10],[-76,7],[-77,4],[-78,1],[-79,-2],[-78,-5],[-76,-10],[-72,-16],[-70,-20],[-70,-25],[-70,-30],[-71,-35],[-72,-40],[-73,-45],[-74,-50]], strength: 0.9 },
+    // ROCKY MOUNTAINS
+    { coords: [[-120,58],[-118,55],[-116,52],[-115,48],[-113,45],[-111,42],[-110,40],[-109,38],[-108,35],[-106,32],[-105,30]], strength: 0.75 },
+    // ALPS
+    { coords: [[5,46],[7,46.5],[8,47],[10,47],[12,47],[14,46.5],[16,46]], strength: 0.55 },
+    // URAL MOUNTAINS - Europe/Asia divide
+    { coords: [[58,50],[59,53],[60,56],[59,59],[58,62],[57,65],[56,68]], strength: 0.45 },
+    // ATLAS MOUNTAINS (North Africa)
+    { coords: [[-5,32],[-3,33],[-1,34],[1,34.5],[3,35],[5,36],[7,35],[9,35]], strength: 0.45 },
+    // GREAT DIVIDING RANGE (Australia)
+    { coords: [[149,-37],[150,-35],[151,-33],[152,-30],[151,-27],[150,-24],[149,-21],[148,-18],[146,-16]], strength: 0.4 },
+    // SCANDINAVIAN MOUNTAINS
+    { coords: [[5,59],[7,61],[9,63],[11,65],[13,67],[15,69],[17,70]], strength: 0.5 },
+    // CAUCASUS
+    { coords: [[37,43],[39,43],[41,42.5],[43,42],[45,42],[48,41]], strength: 0.55 },
+    // APPALACHIANS
+    { coords: [[-84,35],[-82,36],[-81,37],[-80,38],[-79,40],[-78,41],[-76,42],[-75,44]], strength: 0.35 },
+    // TIAN SHAN (Central Asia)
+    { coords: [[68,42],[71,42],[74,42],[77,43],[80,42]], strength: 0.7 },
+    // ALTAI MOUNTAINS
+    { coords: [[83,50],[85,49],[87,48],[89,48],[91,47]], strength: 0.5 },
+    // ETHIOPIAN HIGHLANDS
+    { coords: [[36,14],[37,12],[38,10],[39,8],[40,7]], strength: 0.45 },
+    // DRAKENSBERG (South Africa)
+    { coords: [[28,-29],[29,-30],[29.5,-31],[30,-32]], strength: 0.35 },
+    // ZAGROS MOUNTAINS (Iran)
+    { coords: [[46,37],[48,35],[50,33],[52,31],[54,29],[56,27]], strength: 0.55 },
+    // SIERRA MADRE (Mexico)
+    { coords: [[-107,28],[-106,26],[-105,24],[-104,22],[-103,20],[-102,18]], strength: 0.4 },
+    // CARPATHIANS
+    { coords: [[17,48],[19,49],[21,49],[23,48],[25,47],[26,46],[27,45]], strength: 0.4 },
+    // KUNLUN MOUNTAINS
+    { coords: [[74,36],[78,36],[82,36],[86,36],[90,36],[94,36]], strength: 0.7 },
+  ];
 
   constructor(private ngZone: NgZone) {}
 
   ngAfterViewInit() {
     this.fetchRealtimeWinds();
-    // Refresh wind data every 15 minutes (Open-Meteo updates every 15 min)
     this.windRefreshTimer = setInterval(() => this.fetchRealtimeWinds(), 15 * 60 * 1000);
     this.initCanvas();
+    this.buildOrographicBarriers();
+    this.buildContinentPaths();
     this.animateText();
   }
 
@@ -64,7 +119,10 @@ export class App implements AfterViewInit, OnDestroy {
   @HostListener('window:resize')
   onResize() {
     this.initCanvas();
-    if (this.mapVisible) this.buildContinentPaths();
+    this.buildOrographicBarriers();
+    if (this.rawPolygons.length > 0) {
+      this.projectContinents();
+    }
   }
 
   @HostListener('window:mousemove', ['$event'])
@@ -85,7 +143,6 @@ export class App implements AfterViewInit, OnDestroy {
     if (this.keyBuffer.endsWith('map')) {
       this.mapVisible = !this.mapVisible;
       this.keyBuffer = '';
-      if (this.mapVisible) this.buildContinentPaths();
     }
   }
 
@@ -389,8 +446,22 @@ export class App implements AfterViewInit, OnDestroy {
       v = tl.v * (1 - fx) * (1 - fy) + tr.v * fx * (1 - fy) + bl.v * (1 - fx) * fy + br.v * fx * fy;
     }
 
+    // Sample pre-computed terrain deflection field (orographic + coastline)
+    // O(1) lookup instead of per-particle segment iteration
+    if (this.tfCols > 0 && this.tfRows > 0) {
+      const gx = Math.max(0, Math.min(this.tfCols - 1.001, x / this.tfCellSize));
+      const gy = Math.max(0, Math.min(this.tfRows - 1.001, y / this.tfCellSize));
+      const ix = Math.floor(gx), iy = Math.floor(gy);
+      const fx = gx - ix, fy = gy - iy;
+      const ix1 = Math.min(ix + 1, this.tfCols - 1);
+      const iy1 = Math.min(iy + 1, this.tfRows - 1);
+      const i00 = iy * this.tfCols + ix, i10 = iy * this.tfCols + ix1;
+      const i01 = iy1 * this.tfCols + ix, i11 = iy1 * this.tfCols + ix1;
+      u += this.terrainFieldU[i00] * (1-fx)*(1-fy) + this.terrainFieldU[i10] * fx*(1-fy) + this.terrainFieldU[i01] * (1-fx)*fy + this.terrainFieldU[i11] * fx*fy;
+      v += this.terrainFieldV[i00] * (1-fx)*(1-fy) + this.terrainFieldV[i10] * fx*(1-fy) + this.terrainFieldV[i01] * (1-fx)*fy + this.terrainFieldV[i11] * fx*fy;
+    }
+
     // Turbulence: mesoscale eddies proportional to wind, with a floor for visual continuity
-    // Floor of 0.6 ensures particles are always visible (doldrums, ITCZ calm zones)
     const windMag = Math.sqrt(u * u + v * v);
     const turbulenceScale = Math.max(0.6, windMag * 0.35);
     const curlVx = dPsi_dy * turbulenceScale;
@@ -420,36 +491,18 @@ export class App implements AfterViewInit, OnDestroy {
     const targetOpacity = this.mapVisible ? 1 : 0;
     this.mapOpacity += (targetOpacity - this.mapOpacity) * 0.03;
 
-    // Draw continent outlines UNDER particles when map is active
-    if (this.mapOpacity > 0.01) {
-      this.drawContinents();
-    }
+    // Draw cached map overlay and detailed outlines UNDER particles
+    this.drawContinents();
 
     const t = performance.now() * 0.00005;
 
     for (let i = 0; i < this.particles.length; i++) {
       const p = this.particles[i];
       p.color = p.baseColor;
-      
+
       const fluid = this.getFluidVelocity(p.x, p.y, t);
       let targetVx = fluid.vx * 1.5;
       let targetVy = fluid.vy * 1.5;
-
-      // Deflect particles around continent edges when map is visible
-      if (this.mapOpacity > 0.3) {
-        const deflection = this.getContinentDeflection(p.x, p.y);
-        if (deflection) {
-          targetVx += deflection.vx * this.mapOpacity * 2.5;
-          targetVy += deflection.vy * this.mapOpacity * 2.5;
-          // Tint particles near land
-          const colors = [
-            'rgba(20, 70, 50, 0.6)',
-            'rgba(35, 85, 65, 0.5)',
-            'rgba(50, 100, 80, 0.4)',
-          ];
-          p.color = colors[Math.floor(Math.random() * colors.length)];
-        }
-      }
 
       // Mouse interaction (Sonar/Wake disruption)
       if (this.mouse.x > -500) {
@@ -535,35 +588,195 @@ export class App implements AfterViewInit, OnDestroy {
     return { x, y };
   }
 
+  private rawPolygons: number[][][] = [];
+
   private async buildContinentPaths() {
     try {
-      // Fetch real Natural Earth 110m land polygons (TopoJSON, ~20KB)
-      const response = await fetch('https://cdn.jsdelivr.net/npm/world-atlas@2/land-110m.json');
-      const topo = await response.json();
-      const polygons = this.decodeTopoJSON(topo);
-
-      // Project all polygons to canvas coordinates
-      this.continentPaths = polygons.map(poly =>
-        poly.map(([lon, lat]) => this.lonLatToCanvas(lon, lat))
-      );
-
-      // Build downsampled version for deflection checks (performance)
-      this.deflectionPaths = this.continentPaths.map(path => {
-        if (path.length <= 20) return path;
-        const step = Math.max(1, Math.floor(path.length / 40));
-        const sampled: { x: number, y: number }[] = [];
-        for (let i = 0; i < path.length; i += step) sampled.push(path[i]);
-        return sampled;
-      });
-
-      // Build mountain ranges from TopoJSON 
-      this.mountainRanges = [];
-      console.log(`[Elkwire] Loaded ${this.continentPaths.length} coastline polygons from Natural Earth`);
+      if (this.rawPolygons.length === 0) {
+        const response = await fetch('https://cdn.jsdelivr.net/npm/world-atlas@2/land-110m.json');
+        const topo = await response.json();
+        this.rawPolygons = this.decodeTopoJSON(topo);
+      }
+      this.projectContinents();
     } catch (e) {
       console.warn('[Elkwire] Failed to fetch coastline data, map feature unavailable.', e);
       this.continentPaths = [];
       this.deflectionPaths = [];
       this.mountainRanges = [];
+    }
+  }
+
+  private projectContinents() {
+    this.continentPaths = this.rawPolygons.map(poly =>
+      poly.map(([lon, lat]) => this.lonLatToCanvas(lon, lat))
+    );
+
+    this.deflectionPaths = this.continentPaths.map(path => {
+      if (path.length <= 20) return path;
+      const step = Math.max(1, Math.floor(path.length / 40));
+      const sampled: { x: number, y: number }[] = [];
+      for (let i = 0; i < path.length; i += step) sampled.push(path[i]);
+      return sampled;
+    });
+
+    this.mountainRanges = [];
+    this.buildTerrainField();
+    this.mapCacheDirty = true;
+  }
+
+  private buildTerrainField() {
+    if (!this.width || !this.height) return;
+    this.tfCols = Math.ceil(this.width / this.tfCellSize) + 1;
+    this.tfRows = Math.ceil(this.height / this.tfCellSize) + 1;
+    const len = this.tfCols * this.tfRows;
+    this.terrainFieldU = new Float32Array(len);
+    this.terrainFieldV = new Float32Array(len);
+    
+    for (let y = 0; y < this.tfRows; y++) {
+      for (let x = 0; x < this.tfCols; x++) {
+        const px = x * this.tfCellSize;
+        const py = y * this.tfCellSize;
+        let du = 0, dv = 0;
+
+        // Coastline deflection
+        let closestCoast = Infinity;
+        let cx = 0, cy = 0;
+        for (const path of this.deflectionPaths) {
+          for (let i = 0; i < path.length - 1; i++) {
+            const ax = path[i].x, ay = path[i].y;
+            const bx = path[i + 1].x, by = path[i + 1].y;
+            const abx = bx - ax, aby = by - ay;
+            const apx = px - ax, apy = py - ay;
+            const len2 = abx * abx + aby * aby;
+            if (len2 === 0) continue;
+            const t = Math.max(0, Math.min(1, (apx * abx + apy * aby) / len2));
+            const nx = ax + t * abx, ny = ay + t * aby;
+            const dx = px - nx, dy = py - ny;
+            const dist = Math.sqrt(dx * dx + dy * dy);
+            if (dist < closestCoast && dist < 20) {
+              closestCoast = dist;
+              const dl = dist || 1;
+              cx = dx / dl;
+              cy = dy / dl;
+            }
+          }
+        }
+        if (closestCoast < 20) {
+          const force = Math.pow((20 - closestCoast) / 20, 2) * 2;
+          du += cx * force + (-cy) * force * 0.4;
+          dv += cy * force + cx * force * 0.4;
+        }
+
+        // Orographic deflection
+        let closestMtn = Infinity;
+        let mx = 0, my = 0;
+        let mStr = 0;
+        for (const barrier of this.orographicBarriers) {
+          for (let i = 0; i < barrier.points.length - 1; i++) {
+            const ax = barrier.points[i].x, ay = barrier.points[i].y;
+            const bx = barrier.points[i + 1].x, by = barrier.points[i + 1].y;
+            const abx = bx - ax, aby = by - ay;
+            const apx = px - ax, apy = py - ay;
+            const len2 = abx * abx + aby * aby;
+            if (len2 === 0) continue;
+            const t = Math.max(0, Math.min(1, (apx * abx + apy * aby) / len2));
+            const nx = ax + t * abx, ny = ay + t * aby;
+            const dx = px - nx, dy = py - ny;
+            const dist = Math.sqrt(dx * dx + dy * dy);
+            if (dist < closestMtn && dist < 30) {
+              closestMtn = dist;
+              const dl = dist || 1;
+              mx = dx / dl;
+              my = dy / dl;
+              mStr = barrier.strength;
+            }
+          }
+        }
+        if (closestMtn < 30) {
+          const proximity = (30 - closestMtn) / 30;
+          const force = proximity * proximity * mStr * 3;
+          du += mx * force * 0.6 + (-my) * force * 0.8;
+          dv += my * force * 0.6 + mx * force * 0.8;
+        }
+
+        const idx = y * this.tfCols + x;
+        this.terrainFieldU[idx] = du;
+        this.terrainFieldV[idx] = dv;
+      }
+    }
+  }
+
+  private updateMapCache() {
+    if (!this.mapCache) {
+      this.mapCache = document.createElement('canvas');
+    }
+    this.mapCache.width = this.width;
+    this.mapCache.height = this.height;
+    const ctx = this.mapCache.getContext('2d');
+    if (!ctx) return;
+
+    ctx.clearRect(0, 0, this.width, this.height);
+
+    for (const path of this.continentPaths) {
+      if (path.length < 3) continue;
+      ctx.beginPath();
+      ctx.moveTo(path[0].x, path[0].y);
+      for (let i = 1; i < path.length; i++) {
+        ctx.lineTo(path[i].x, path[i].y);
+      }
+      ctx.closePath();
+      ctx.fillStyle = `rgba(2, 6, 12, 0.4)`;
+      ctx.fill();
+    }
+
+    this.mapCacheDirty = false;
+  }
+
+  private drawContinents() {
+    if (this.mapCacheDirty) {
+      this.updateMapCache();
+    }
+    
+    if (this.mapCache) {
+      this.ctx.drawImage(this.mapCache, 0, 0);
+    }
+    
+    const alpha = this.mapOpacity;
+    if (alpha > 0.01) {
+      const ctx = this.ctx;
+      
+      ctx.save();
+      ctx.shadowColor = `rgba(40, 160, 120, ${0.25 * alpha})`;
+      ctx.shadowBlur = 6;
+      ctx.strokeStyle = `rgba(30, 110, 80, ${0.4 * alpha})`;
+      ctx.lineWidth = 1;
+      for (const path of this.continentPaths) {
+        if (path.length < 3) continue;
+        ctx.beginPath();
+        ctx.moveTo(path[0].x, path[0].y);
+        for (let i = 1; i < path.length; i++) {
+          ctx.lineTo(path[i].x, path[i].y);
+        }
+        ctx.closePath();
+        ctx.stroke();
+      }
+      ctx.restore();
+
+      ctx.save();
+      ctx.shadowColor = `rgba(90, 170, 130, ${0.2 * alpha})`;
+      ctx.shadowBlur = 5;
+      for (const barrier of this.orographicBarriers) {
+        if (barrier.points.length < 2) continue;
+        ctx.beginPath();
+        ctx.moveTo(barrier.points[0].x, barrier.points[0].y);
+        for (let i = 1; i < barrier.points.length; i++) {
+          ctx.lineTo(barrier.points[i].x, barrier.points[i].y);
+        }
+        ctx.strokeStyle = `rgba(60, 130, 100, ${0.25 * barrier.strength * alpha})`;
+        ctx.lineWidth = 1 + barrier.strength;
+        ctx.stroke();
+      }
+      ctx.restore();
     }
   }
 
@@ -577,7 +790,6 @@ export class App implements AfterViewInit, OnDestroy {
     const sx = transform.scale[0], sy = transform.scale[1];
     const tx = transform.translate[0], ty = transform.translate[1];
 
-    // Decode delta-encoded, quantized arcs → absolute [lon, lat]
     const decodedArcs: number[][][] = rawArcs.map((arc: number[][]) => {
       let x = 0, y = 0;
       return arc.map((pt: number[]) => {
@@ -587,18 +799,15 @@ export class App implements AfterViewInit, OnDestroy {
       });
     });
 
-    // Resolve arc index (negative = reversed)
     const resolveArc = (idx: number): number[][] => {
       if (idx >= 0) return decodedArcs[idx];
       return [...decodedArcs[~idx]].reverse();
     };
 
-    // Stitch a ring of arc indices into a single coordinate array
     const stitchRing = (ring: number[]): number[][] => {
       const coords: number[][] = [];
       for (const idx of ring) {
         const arc = resolveArc(idx);
-        // Skip first point of subsequent arcs (shared with previous arc's last point)
         for (let i = coords.length > 0 ? 1 : 0; i < arc.length; i++) {
           coords.push(arc[i]);
         }
@@ -611,7 +820,6 @@ export class App implements AfterViewInit, OnDestroy {
 
     const processGeometry = (geom: any) => {
       if (geom.type === 'Polygon') {
-        // Only use exterior ring (index 0), skip holes
         polygons.push(stitchRing(geom.arcs[0]));
       } else if (geom.type === 'MultiPolygon') {
         for (const polygon of geom.arcs) {
@@ -626,100 +834,11 @@ export class App implements AfterViewInit, OnDestroy {
     return polygons;
   }
 
-  private drawContinents() {
-    const ctx = this.ctx;
-    const alpha = this.mapOpacity;
-
-    // Draw filled landmasses
-    for (const path of this.continentPaths) {
-      if (path.length < 3) continue;
-
-      ctx.beginPath();
-      ctx.moveTo(path[0].x, path[0].y);
-      for (let i = 1; i < path.length; i++) {
-        ctx.lineTo(path[i].x, path[i].y);
-      }
-      ctx.closePath();
-      ctx.fillStyle = `rgba(6, 24, 18, ${0.2 * alpha})`;
-      ctx.fill();
-    }
-
-    // Draw coastline outlines with glow
-    ctx.save();
-    ctx.shadowColor = `rgba(40, 160, 120, ${0.25 * alpha})`;
-    ctx.shadowBlur = 6;
-    ctx.strokeStyle = `rgba(30, 110, 80, ${0.4 * alpha})`;
-    ctx.lineWidth = 1;
-    for (const path of this.continentPaths) {
-      if (path.length < 3) continue;
-      ctx.beginPath();
-      ctx.moveTo(path[0].x, path[0].y);
-      for (let i = 1; i < path.length; i++) {
-        ctx.lineTo(path[i].x, path[i].y);
-      }
-      ctx.closePath();
-      ctx.stroke();
-    }
-    ctx.restore();
-
-    // Draw latitude/longitude grid
-    ctx.strokeStyle = `rgba(20, 60, 80, ${0.05 * alpha})`;
-    ctx.lineWidth = 0.5;
-    for (let lat = -60; lat <= 75; lat += 15) {
-      const p1 = this.lonLatToCanvas(-180, lat);
-      const p2 = this.lonLatToCanvas(180, lat);
-      ctx.beginPath();
-      ctx.moveTo(p1.x, p1.y);
-      ctx.lineTo(p2.x, p2.y);
-      ctx.stroke();
-    }
-    for (let lon = -150; lon <= 180; lon += 30) {
-      const p1 = this.lonLatToCanvas(lon, -80);
-      const p2 = this.lonLatToCanvas(lon, 80);
-      ctx.beginPath();
-      ctx.moveTo(p1.x, p1.y);
-      ctx.lineTo(p2.x, p2.y);
-      ctx.stroke();
-    }
-  }
-
-  private drawMountainGlow() {
-    // Mountains are now implicit in the coastline data fidelity
-    // No separate mountain rendering needed
-  }
-
-
-  private getContinentDeflection(px: number, py: number): { vx: number, vy: number } | null {
-    const threshold = 20;
-    let closestDist = Infinity;
-    let nx = 0, ny = 0;
-
-    for (const path of this.deflectionPaths) {
-      for (let i = 0; i < path.length - 1; i++) {
-        const ax = path[i].x, ay = path[i].y;
-        const bx = path[i + 1].x, by = path[i + 1].y;
-        const abx = bx - ax, aby = by - ay;
-        const apx = px - ax, apy = py - ay;
-        const len2 = abx * abx + aby * aby;
-        if (len2 === 0) continue;
-        const t = Math.max(0, Math.min(1, (apx * abx + apy * aby) / len2));
-        const cx = ax + t * abx, cy = ay + t * aby;
-        const dx = px - cx, dy = py - cy;
-        const dist = Math.sqrt(dx * dx + dy * dy);
-        if (dist < closestDist && dist < threshold) {
-          closestDist = dist;
-          const len = dist || 1;
-          nx = dx / len;
-          ny = dy / len;
-        }
-      }
-    }
-
-    if (closestDist < threshold) {
-      const force = Math.pow((threshold - closestDist) / threshold, 2) * 2;
-      return { vx: nx * force + (-ny) * force * 0.4, vy: ny * force + nx * force * 0.4 };
-    }
-    return null;
+  private buildOrographicBarriers() {
+    this.orographicBarriers = App.MOUNTAIN_DATA.map(m => ({
+      points: m.coords.map(([lon, lat]) => this.lonLatToCanvas(lon, lat)),
+      strength: m.strength
+    }));
   }
 }
 
