@@ -155,14 +155,13 @@ export class App implements AfterViewInit, OnDestroy {
 
   private async fetchRealtimeWinds() {
     try {
-      // Build a denser grid: every 10° lat × 15° lon = 19 rows × 25 cols = 475 points
-      // Open-Meteo supports up to 1000 locations per request
-      this.gridRows = 19;
-      this.gridCols = 25;
+      // Smaller grid: 7 rows × 13 cols = 91 points (avoids API rate limits)
+      this.gridRows = 7;
+      this.gridCols = 13;
       const lats: number[] = [];
       const lons: number[] = [];
-      for (let lat = 90; lat >= -90; lat -= 10) {
-        for (let lon = -180; lon <= 180; lon += 15) {
+      for (let lat = 75; lat >= -75; lat -= 25) {
+        for (let lon = -180; lon <= 180; lon += 30) {
           lats.push(lat);
           lons.push(lon);
         }
@@ -183,18 +182,13 @@ export class App implements AfterViewInit, OnDestroy {
           for (let j = 0; j < this.gridCols; j++) {
             const pointData = data[index]?.current;
             if (pointData) {
-              const speed = pointData.wind_speed_10m ?? 0; // km/h
-              const dir = pointData.wind_direction_10m ?? 0; // degrees (meteorological: direction wind blows FROM)
-              const pressure = pointData.surface_pressure ?? 1013.25; // hPa
-
-              // Meteorological convention: direction = where wind comes FROM
-              // u_met = -S * sin(θ)  [positive = eastward, i.e. wind blowing TO the east]
-              // v_met = -S * cos(θ)  [positive = northward]
-              // Canvas: +x = east, +y = south, so vy_canvas = -v_met = S * cos(θ)
+              const speed = pointData.wind_speed_10m ?? 0;
+              const dir = pointData.wind_direction_10m ?? 0;
+              const pressure = pointData.surface_pressure ?? 1013.25;
               const rad = dir * Math.PI / 180;
-              const normalizedSpeed = speed / 20; // Normalize: ~20 km/h → magnitude 1.0
+              const normalizedSpeed = speed / 20;
               const u = -Math.sin(rad) * normalizedSpeed;
-              const v = Math.cos(rad) * normalizedSpeed;  // Flipped sign for canvas +y=south
+              const v = Math.cos(rad) * normalizedSpeed;
               windRow.push({ u, v });
               pressRow.push(pressure);
             } else {
@@ -207,24 +201,21 @@ export class App implements AfterViewInit, OnDestroy {
           this.pressureGrid.push(pressRow);
         }
         this.dataReady = true;
-        console.log(`[Elkwire] Real-time wind data loaded: ${this.gridRows}×${this.gridCols} grid (${data.length} stations)`);
+        console.log(`[Elkwire] Real-time wind data loaded: ${this.gridRows}×${this.gridCols} grid`);
       } else {
-        console.warn('[Elkwire] Unexpected API response shape, using atmospheric model fallback.');
+        console.warn('[Elkwire] Unexpected API response, using fallback.');
         this.buildFallbackGrid();
       }
     } catch (e) {
-      console.warn('[Elkwire] Could not fetch real-time winds, using atmospheric model fallback.', e);
+      console.warn('[Elkwire] API unavailable, using atmospheric model fallback.', e);
       this.buildFallbackGrid();
     }
   }
 
   /**
-   * Physics-accurate atmospheric general circulation fallback.
-   * Models the three-cell structure (Hadley, Ferrel, Polar) with:
-   *   - Coriolis deflection (rightward NH, leftward SH)
-   *   - Pressure gradient force (drives meridional flow)
-   *   - Seasonal ITCZ shift based on current month
-   *   - Jet stream intensification at cell boundaries (30° and 60°)
+   * Physics-accurate atmospheric fallback with regional monsoon features.
+   * 19×25 grid for high resolution.
+   * Includes three-cell circulation + all major monsoon systems.
    */
   private buildFallbackGrid() {
     this.gridRows = 19;
@@ -232,83 +223,119 @@ export class App implements AfterViewInit, OnDestroy {
     this.windGrid = [];
     this.pressureGrid = [];
 
-    const month = new Date().getMonth(); // 0-11
-    // ITCZ shifts ~10° north in NH summer (Jun-Aug), ~5° south in NH winter (Dec-Feb)
-    const itczShift = 8 * Math.sin((month - 3) * Math.PI / 6); // Peaks in July at +8°
+    const month = new Date().getMonth();
+    const itczShift = 8 * Math.sin((month - 3) * Math.PI / 6);
+    const monsoonStrength = Math.max(0, Math.sin((month - 4) * Math.PI / 5));
+    const winterMonsoon = Math.max(0, Math.sin((month - 10) * Math.PI / 4));
 
     for (let i = 0; i < this.gridRows; i++) {
       const windRow: { u: number, v: number }[] = [];
       const pressRow: number[] = [];
-      const lat = 90 - i * 10; // 90°N to 90°S
+      const lat = 90 - i * 10;
 
       for (let j = 0; j < this.gridCols; j++) {
-        // Effective latitude relative to ITCZ
+        const lon = -180 + j * 15;
         const effectiveLat = lat - itczShift;
         const absLat = Math.abs(effectiveLat);
-        const hemisphere = effectiveLat >= 0 ? 1 : -1; // +1 for NH, -1 for SH
+        const hemisphere = effectiveLat >= 0 ? 1 : -1;
 
-        let uZonal = 0;   // East-West (canvas: positive = eastward)
-        let vMerid = 0;   // North-South (canvas: positive = southward)
+        let uZonal = 0;
+        let vMerid = 0;
         let pressure = 1013.25;
 
+        // === BASE: Three-cell circulation ===
         if (absLat < 30) {
-          // HADLEY CELL: Surface trade winds
-          // Air flows equatorward, Coriolis deflects to west → NE trades (NH) / SE trades (SH)
-          const cellProgress = absLat / 30; // 0 at equator, 1 at 30°
-          const intensity = Math.sin(cellProgress * Math.PI); // Peak at 15°
-
-          // Zonal: Easterly (negative u) due to Coriolis deflection
-          // Coriolis increases with latitude: f = 2Ω sin(φ)
+          const cellProgress = absLat / 30;
+          const intensity = Math.sin(cellProgress * Math.PI);
           const coriolisScale = Math.sin(absLat * Math.PI / 180);
           uZonal = -1.8 * intensity * (0.3 + 0.7 * coriolisScale);
-
-          // Meridional: Equatorward convergence (+v in NH means southward = toward equator)
-          vMerid = 0.5 * intensity * hemisphere; // +south in NH, -south in SH (both toward equator)
-
-          // Near ITCZ (equator): convergence zone → low pressure, near-calm winds
-          if (absLat < 5) {
-            const itczDamping = absLat / 5;
-            uZonal *= itczDamping;
-            vMerid *= itczDamping;
-          }
-
-          // Pressure: Low at ITCZ (~1008), high at subtropical ridge (~1022)
+          vMerid = 0.5 * intensity * hemisphere;
+          if (absLat < 5) { uZonal *= absLat / 5; vMerid *= absLat / 5; }
           pressure = 1008 + 14 * cellProgress;
         } else if (absLat < 60) {
-          // FERREL CELL: Surface westerlies
-          // Air flows poleward, Coriolis deflects to east → SW winds (NH) / NW winds (SH)
-          const cellProgress = (absLat - 30) / 30; // 0 at 30°, 1 at 60°
-          const intensity = Math.sin(cellProgress * Math.PI); // Peak at 45°
-
-          // Zonal: Westerly (positive u) — strongest mid-latitude winds
-          // Jet stream enhancement near 30° and 60° cell boundaries
-          const jetBoost30 = Math.exp(-Math.pow((absLat - 30) / 5, 2)) * 0.8;
-          const jetBoost60 = Math.exp(-Math.pow((absLat - 60) / 5, 2)) * 0.6;
-          uZonal = 2.5 * intensity + jetBoost30 + jetBoost60;
-
-          // Meridional: Poleward flow (-v in NH means northward = poleward)
+          const cellProgress = (absLat - 30) / 30;
+          const intensity = Math.sin(cellProgress * Math.PI);
+          uZonal = 2.5 * intensity + Math.exp(-Math.pow((absLat - 30) / 5, 2)) * 0.8 + Math.exp(-Math.pow((absLat - 60) / 5, 2)) * 0.6;
           vMerid = -0.6 * intensity * hemisphere;
-
-          // Pressure: High at subtropical ridge (~1022), low at subpolar low (~1005)
           pressure = 1022 - 17 * cellProgress;
         } else {
-          // POLAR CELL: Polar easterlies
-          // Air flows equatorward, Coriolis deflects to west
-          const cellProgress = (absLat - 60) / 30; // 0 at 60°, 1 at 90°
-          const intensity = Math.sin(cellProgress * Math.PI * 0.8); // Weaker cell
-
-          // Zonal: Easterly (negative u)
+          const cellProgress = (absLat - 60) / 30;
+          const intensity = Math.sin(cellProgress * Math.PI * 0.8);
           uZonal = -1.0 * intensity;
-
-          // Meridional: Equatorward
           vMerid = 0.4 * intensity * hemisphere;
-
-          // Polar high pressure at pole
           pressure = 1005 + 15 * cellProgress;
         }
 
-        // Convert meteorological u/v to canvas coordinates
-        // Canvas: +x = east (same as met u), +y = south (opposite of met v → already handled above)
+        // === INDIAN SW MONSOON (Jun-Sep): Arabian Sea → Kerala/Western Ghats ===
+        if (lat >= -5 && lat <= 30 && lon >= 40 && lon <= 100 && monsoonStrength > 0) {
+          const latF = Math.sin(Math.max(0, Math.min(1, (lat + 5) / 30)) * Math.PI);
+          const lonF = Math.exp(-Math.pow((lon - 70) / 25, 2));
+          const s = monsoonStrength * latF * lonF;
+          uZonal += 2.5 * s;   // Strong westerly
+          vMerid += -1.5 * s;  // Strong northward
+          pressure -= 8 * s;
+        }
+
+        // === SOMALI JET (Jun-Sep): Cross-equatorial low-level jet ===
+        if (lat >= -5 && lat <= 15 && lon >= 40 && lon <= 55 && monsoonStrength > 0) {
+          const s = monsoonStrength * Math.exp(-Math.pow((lon - 48) / 6, 2));
+          uZonal += 1.5 * s;
+          vMerid += -2.0 * s;
+        }
+
+        // === EAST ASIAN MONSOON (Jun-Aug) ===
+        if (lat >= 10 && lat <= 40 && lon >= 100 && lon <= 140 && monsoonStrength > 0) {
+          const latF = Math.sin(Math.max(0, Math.min(1, (lat - 10) / 30)) * Math.PI);
+          const lonF = Math.exp(-Math.pow((lon - 120) / 15, 2));
+          const s = monsoonStrength * 0.7 * latF * lonF;
+          uZonal += 1.0 * s;
+          vMerid += -1.2 * s;
+        }
+
+        // === WEST AFRICAN MONSOON (Jun-Sep) ===
+        if (lat >= 0 && lat <= 20 && lon >= -20 && lon <= 20 && monsoonStrength > 0) {
+          const latF = Math.sin(Math.max(0, Math.min(1, lat / 20)) * Math.PI);
+          const lonF = Math.exp(-Math.pow(lon / 15, 2));
+          const s = monsoonStrength * 0.6 * latF * lonF;
+          uZonal += 1.2 * s;
+          vMerid += -0.8 * s;
+        }
+
+        // === WINTER NE MONSOON (Dec-Feb) over India ===
+        if (lat >= 0 && lat <= 30 && lon >= 60 && lon <= 100 && winterMonsoon > 0) {
+          const latF = Math.sin(Math.max(0, Math.min(1, lat / 30)) * Math.PI);
+          const lonF = Math.exp(-Math.pow((lon - 80) / 15, 2));
+          const s = winterMonsoon * 0.8 * latF * lonF;
+          uZonal -= 1.5 * s;
+          vMerid += 1.0 * s;
+        }
+
+        // === SUBTROPICAL HIGHS (clockwise NH, counter-clockwise SH) ===
+        // Azores/Bermuda High
+        if (lat >= 15 && lat <= 45 && lon >= -70 && lon <= 0) {
+          const dL = (lat - 32) / 15, dN = (lon - (-35)) / 20;
+          const d2 = dL * dL + dN * dN;
+          if (d2 < 1) { const s = (1 - d2) * 0.8; uZonal += dL * s * 1.5; vMerid += dN * s * 1.5; pressure += 6 * (1 - d2); }
+        }
+        // North Pacific High
+        if (lat >= 20 && lat <= 45 && lon >= -170 && lon <= -120) {
+          const dL = (lat - 35) / 15, dN = (lon - (-145)) / 20;
+          const d2 = dL * dL + dN * dN;
+          if (d2 < 1) { const s = (1 - d2) * 0.7; uZonal += dL * s * 1.3; vMerid += dN * s * 1.3; pressure += 5 * (1 - d2); }
+        }
+        // Mascarene High (drives Indian monsoon moisture)
+        if (lat >= -40 && lat <= -15 && lon >= 40 && lon <= 90 && monsoonStrength > 0) {
+          const dL = (lat + 30) / 12, dN = (lon - 65) / 20;
+          const d2 = dL * dL + dN * dN;
+          if (d2 < 1) { const s = (1 - d2) * monsoonStrength * 0.8; uZonal -= dL * s * 1.2; vMerid -= dN * s * 1.2; pressure += 4 * (1 - d2); }
+        }
+
+        // === MEDITERRANEAN ETESIAN WINDS (Jun-Sep) ===
+        if (lat >= 30 && lat <= 42 && lon >= 15 && lon <= 35 && monsoonStrength > 0) {
+          uZonal -= 0.8 * monsoonStrength * 0.5;
+          vMerid += 0.6 * monsoonStrength * 0.5;
+        }
+
         windRow.push({ u: uZonal, v: vMerid });
         pressRow.push(pressure);
       }
@@ -316,7 +343,7 @@ export class App implements AfterViewInit, OnDestroy {
       this.pressureGrid.push(pressRow);
     }
     this.dataReady = true;
-    console.log('[Elkwire] Atmospheric model fallback initialized (Hadley-Ferrel-Polar cells with Coriolis).');
+    console.log('[Elkwire] Atmospheric model with monsoon circulation initialized.');
   }
 
   private initCanvas() {
