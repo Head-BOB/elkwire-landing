@@ -50,6 +50,14 @@ export class App implements AfterViewInit, OnDestroy {
   private tfRows = 0;
   private tfCellSize = 20;
   private isTouchDevice = false;
+  // Mobile viewport: show portion of world, slowly scroll
+  private isMobileViewport = false;
+  private viewportLon = 0; // Center longitude of viewport (degrees)
+  private viewportWidthDeg = 360; // Degrees of longitude visible
+  // Simulation evolution
+  private lastApiCall = 0;
+  private simElapsed = 0;
+  private lastFrameTime = 0;
 
   // Real-world mountain range data: [lon, lat] polylines with relative strength
   // Strength represents barrier height/effectiveness (1.0 = Himalayas-class)
@@ -100,12 +108,15 @@ export class App implements AfterViewInit, OnDestroy {
 
   ngAfterViewInit() {
     this.isTouchDevice = 'ontouchstart' in window || navigator.maxTouchPoints > 0;
+    this.isMobileViewport = this.isTouchDevice && window.innerWidth < 900;
     this.fetchRealtimeWinds();
-    this.windRefreshTimer = setInterval(() => this.fetchRealtimeWinds(), 15 * 60 * 1000);
+    // API refresh: 2x per day instead of every 15min to avoid rate limits
+    this.windRefreshTimer = setInterval(() => this.fetchRealtimeWinds(), 12 * 60 * 60 * 1000);
     this.initCanvas();
     this.buildOrographicBarriers();
     this.buildContinentPaths();
     this.animateText();
+    this.lastFrameTime = performance.now();
   }
 
   ngOnDestroy() {
@@ -119,6 +130,7 @@ export class App implements AfterViewInit, OnDestroy {
 
   @HostListener('window:resize')
   onResize() {
+    this.isMobileViewport = this.isTouchDevice && window.innerWidth < 900;
     this.initCanvas();
     this.buildOrographicBarriers();
     if (this.rawPolygons.length > 0) {
@@ -346,30 +358,103 @@ export class App implements AfterViewInit, OnDestroy {
     console.log('[Elkwire] Atmospheric model with monsoon circulation initialized.');
   }
 
+  /**
+   * Evolve the wind field between API calls using simplified atmospheric dynamics.
+   * Pressure systems drift, diurnal thermal cycle modulates monsoon, winds re-derived.
+   */
+  private evolveWindField() {
+    if (!this.dataReady || this.windGrid.length === 0) return;
+
+    const hour = new Date().getHours() + new Date().getMinutes() / 60;
+    const month = new Date().getMonth();
+    // Diurnal factor: monsoon intensifies in afternoon (12-18h local), weakens at night
+    const diurnalFactor = 0.85 + 0.15 * Math.sin((hour - 6) * Math.PI / 12);
+    // Pressure drift: mid-latitude systems move east at ~0.5°/evolution-step
+    const driftLon = 0.5; // degrees per evolution step (~60s)
+
+    const newGrid: { u: number, v: number }[][] = [];
+    const newPressure: number[][] = [];
+
+    for (let i = 0; i < this.gridRows; i++) {
+      const windRow: { u: number, v: number }[] = [];
+      const pressRow: number[] = [];
+      const lat = 90 - i * (180 / (this.gridRows - 1));
+
+      for (let j = 0; j < this.gridCols; j++) {
+        // Mid-latitude pressure systems drift eastward
+        // Tropical systems are more stationary
+        const latFactor = Math.abs(lat) > 25 ? 1.0 : 0.2;
+        const srcJ = j - Math.round(driftLon / (360 / this.gridCols) * latFactor);
+        const wrappedJ = ((srcJ % this.gridCols) + this.gridCols) % this.gridCols;
+
+        const oldWind = this.windGrid[i][wrappedJ];
+        const oldPressure = this.pressureGrid[i]?.[wrappedJ] ?? 1013.25;
+
+        // Apply diurnal modulation to tropical winds (monsoon regions)
+        let u = oldWind.u;
+        let v = oldWind.v;
+        if (Math.abs(lat) < 30) {
+          u *= diurnalFactor;
+          v *= diurnalFactor;
+        }
+
+        // Derive geostrophic correction from pressure gradients
+        if (i > 0 && i < this.gridRows - 1 && j > 0 && j < this.gridCols - 1) {
+          const pN = this.pressureGrid[i - 1]?.[j] ?? oldPressure;
+          const pS = this.pressureGrid[i + 1]?.[j] ?? oldPressure;
+          const pW = this.pressureGrid[i]?.[j - 1] ?? oldPressure;
+          const pE = this.pressureGrid[i]?.[j + 1] ?? oldPressure;
+          // Geostrophic: wind perpendicular to pressure gradient, scaled by Coriolis
+          const f = 2 * 7.292e-5 * Math.sin(lat * Math.PI / 180);
+          if (Math.abs(f) > 1e-6) {
+            const dpdy = (pS - pN) * 0.01; // pressure gradient (meridional)
+            const dpdx = (pE - pW) * 0.01; // pressure gradient (zonal)
+            // Blend 5% geostrophic correction into existing wind
+            u += (-dpdy / f) * 0.05;
+            v += (dpdx / f) * 0.05;
+          }
+        }
+
+        windRow.push({ u, v });
+        pressRow.push(oldPressure);
+      }
+      newGrid.push(windRow);
+      newPressure.push(pressRow);
+    }
+
+    this.windGrid = newGrid;
+    this.pressureGrid = newPressure;
+  }
+
   private initCanvas() {
     const canvas = this.canvasRef.nativeElement;
     this.ctx = canvas.getContext('2d', { alpha: false })!;
     this.width = window.innerWidth;
     this.height = window.innerHeight;
     
-    // High DPI support for sharp rendering
+    // Set mobile viewport dimensions
+    if (this.isMobileViewport) {
+      // Show longitude range proportional to aspect ratio (portrait shows ~120°)
+      this.viewportWidthDeg = Math.min(360, 180 * (this.width / this.height));
+    } else {
+      this.viewportWidthDeg = 360;
+    }
+    
     const dpr = window.devicePixelRatio || 1;
     canvas.width = this.width * dpr;
     canvas.height = this.height * dpr;
     this.ctx.scale(dpr, dpr);
     
-    // Initialize particles
     this.particles = [];
     const particleCount = Math.min(Math.floor((this.width * this.height) / 800), 2500);
     
     for (let i = 0; i < particleCount; i++) {
       const p = {} as Particle;
       this.resetParticle(p);
-      p.life = Math.random() * p.maxLife; // Stagger initial lives
+      p.life = Math.random() * p.maxLife;
       this.particles.push(p);
     }
 
-    // Initial clear
     this.ctx.fillStyle = '#020408';
     this.ctx.fillRect(0, 0, this.width, this.height);
 
@@ -439,7 +524,6 @@ export class App implements AfterViewInit, OnDestroy {
     const sy = y * scale;
     const eps = 0.01;
 
-    // Curl of stream function → divergence-free turbulent eddies
     const n1 = this.fbm(sx, sy + eps - t);
     const n2 = this.fbm(sx, sy - eps - t);
     const dPsi_dy = (n1 - n2) / (2 * eps);
@@ -448,20 +532,28 @@ export class App implements AfterViewInit, OnDestroy {
     const n4 = this.fbm(sx - eps - t, sy);
     const dPsi_dx = (n3 - n4) / (2 * eps);
 
-    // Bilinear interpolation of the wind grid (always populated: real data or physics fallback)
     let u = 0;
     let v = 0;
 
     if (this.dataReady && this.windGrid.length === this.gridRows) {
-      const normX = Math.max(0, Math.min(1, x / (this.width || 1)));
+      // Convert canvas position to normalized grid position
+      // On mobile: canvas x maps to viewport longitude range
+      // On desktop: canvas x maps to full 360° range
+      let normX: number;
+      if (this.isMobileViewport) {
+        // Canvas x → longitude → normalized grid position
+        const lon = this.viewportLon + ((x / this.width) - 0.5) * this.viewportWidthDeg;
+        // Wrap to [0, 360)
+        normX = (((lon + 180) % 360) + 360) % 360 / 360;
+      } else {
+        normX = Math.max(0, Math.min(1, x / (this.width || 1)));
+      }
       const normY = Math.max(0, Math.min(1, y / (this.height || 1)));
 
       const gx = normX * (this.gridCols - 1);
       const gy = normY * (this.gridRows - 1);
-
       const ix = Math.max(0, Math.min(Math.floor(gx), this.gridCols - 2));
       const iy = Math.max(0, Math.min(Math.floor(gy), this.gridRows - 2));
-
       const fx = gx - ix;
       const fy = gy - iy;
 
@@ -474,9 +566,8 @@ export class App implements AfterViewInit, OnDestroy {
       v = tl.v * (1 - fx) * (1 - fy) + tr.v * fx * (1 - fy) + bl.v * (1 - fx) * fy + br.v * fx * fy;
     }
 
-    // Sample pre-computed terrain deflection field (orographic + coastline)
-    // O(1) lookup instead of per-particle segment iteration
-    if (this.tfCols > 0 && this.tfRows > 0) {
+    // Terrain deflection (desktop only - mobile skips for perf)
+    if (!this.isMobileViewport && this.tfCols > 0 && this.tfRows > 0) {
       const gx = Math.max(0, Math.min(this.tfCols - 1.001, x / this.tfCellSize));
       const gy = Math.max(0, Math.min(this.tfRows - 1.001, y / this.tfCellSize));
       const ix = Math.floor(gx), iy = Math.floor(gy);
@@ -489,19 +580,20 @@ export class App implements AfterViewInit, OnDestroy {
       v += this.terrainFieldV[i00] * (1-fx)*(1-fy) + this.terrainFieldV[i10] * fx*(1-fy) + this.terrainFieldV[i01] * (1-fx)*fy + this.terrainFieldV[i11] * fx*fy;
     }
 
-    // Turbulence: mesoscale eddies proportional to wind, with a floor for visual continuity
     const windMag = Math.sqrt(u * u + v * v);
     const turbulenceScale = Math.max(0.6, windMag * 0.35);
     const curlVx = dPsi_dy * turbulenceScale;
     const curlVy = -dPsi_dx * turbulenceScale;
 
-    return {
-      vx: u + curlVx,
-      vy: v + curlVy
-    }; 
+    return { vx: u + curlVx, vy: v + curlVy }; 
   }
 
   private renderLoop = () => {
+    const now = performance.now();
+    const dt = Math.min(now - this.lastFrameTime, 50); // Cap at 50ms to prevent spiral
+    this.lastFrameTime = now;
+    this.simElapsed += dt;
+
     // Smooth cursor follow
     if (this.mouse.targetX !== -1000) {
       this.mouse.x += (this.mouse.targetX - this.mouse.x) * 0.15;
@@ -511,14 +603,30 @@ export class App implements AfterViewInit, OnDestroy {
       this.mouse.y += (-1000 - this.mouse.y) * 0.1;
     }
 
-    // Faint clear for fluid trail effect (the core of the current/wind look)
+    // Mobile: slowly pan viewport east→west (Earth rotation)
+    if (this.isMobileViewport) {
+      this.viewportLon += 0.015; // ~5.4°/min → full rotation in ~67 min
+      if (this.viewportLon > 180) this.viewportLon -= 360;
+    }
+
+    // Evolve wind simulation every 60 seconds
+    if (this.simElapsed > 60000) {
+      this.simElapsed = 0;
+      this.evolveWindField();
+    }
+
+    // Faint clear for fluid trail effect
     this.ctx.fillStyle = 'rgba(0, 12, 24, 0.08)';
     this.ctx.fillRect(0, 0, this.width, this.height);
 
-    // Draw dark continent silhouettes from cached offscreen canvas
-    this.drawContinents();
+    // Draw continent silhouettes
+    if (this.isMobileViewport) {
+      this.drawContinentsDirect(); // Direct draw (viewport changes each frame)
+    } else {
+      this.drawContinents(); // Cached (static viewport)
+    }
 
-    const t = performance.now() * 0.00005;
+    const t = now * 0.00005;
 
     for (let i = 0; i < this.particles.length; i++) {
       const p = this.particles[i];
@@ -528,8 +636,8 @@ export class App implements AfterViewInit, OnDestroy {
       let targetVx = fluid.vx * 1.5;
       let targetVy = fluid.vy * 1.5;
 
-      // Mouse interaction (Sonar/Wake disruption)
-      if (this.mouse.x > -500) {
+      // Mouse interaction (desktop only)
+      if (!this.isTouchDevice && this.mouse.x > -500) {
         const dx = p.x - this.mouse.x;
         const dy = p.y - this.mouse.y;
         const dist = Math.sqrt(dx * dx + dy * dy);
@@ -551,6 +659,12 @@ export class App implements AfterViewInit, OnDestroy {
       p.y += p.vy;
       p.life--;
 
+      // Mobile: wrap particles at horizontal edges for infinite scroll
+      if (this.isMobileViewport) {
+        if (p.x < -20) { p.x += this.width + 40; p.lastX = p.x; }
+        else if (p.x > this.width + 20) { p.x -= this.width + 40; p.lastX = p.x; }
+      }
+
       if (p.life <= 0 || p.x < -50 || p.x > this.width + 50 || p.y < -50 || p.y > this.height + 50 || isNaN(p.x) || isNaN(p.y)) {
         this.resetParticle(p);
       } else {
@@ -563,8 +677,7 @@ export class App implements AfterViewInit, OnDestroy {
       }
     }
 
-
-    // Draw Cursor Reticle (desktop only)
+    // Cursor reticle (desktop only)
     if (!this.isTouchDevice && this.mouse.x > -500) {
       this.ctx.strokeStyle = 'rgba(100, 160, 200, 0.2)';
       this.ctx.lineWidth = 1;
@@ -603,7 +716,15 @@ export class App implements AfterViewInit, OnDestroy {
   // --- MAP FEATURE ---
 
   private lonLatToCanvas(lon: number, lat: number): { x: number, y: number } {
-    const x = ((lon + 180) / 360) * this.width;
+    let x: number;
+    if (this.isMobileViewport) {
+      let relLon = lon - this.viewportLon;
+      while (relLon > 180) relLon -= 360;
+      while (relLon < -180) relLon += 360;
+      x = ((relLon / this.viewportWidthDeg) + 0.5) * this.width;
+    } else {
+      x = ((lon + 180) / 360) * this.width;
+    }
     const y = ((90 - lat) / 180) * this.height;
     return { x, y };
   }
@@ -745,7 +866,7 @@ export class App implements AfterViewInit, OnDestroy {
         ctx.lineTo(path[i].x, path[i].y);
       }
       ctx.closePath();
-      ctx.fillStyle = `rgba(2, 6, 12, 0.4)`;
+      ctx.fillStyle = 'rgba(0, 4, 10, 0.012)';
       ctx.fill();
     }
 
@@ -753,12 +874,45 @@ export class App implements AfterViewInit, OnDestroy {
   }
 
   private drawContinents() {
-    // Always draw the ultra-subtle dark continent silhouettes from cache
     if (this.mapCacheDirty) {
       this.updateMapCache();
     }
     if (this.mapCache) {
       this.ctx.drawImage(this.mapCache, 0, 0);
+    }
+  }
+
+  /**
+   * Draw continents directly for mobile viewport (no cache, re-projects each frame).
+   * Only draws polygons that are within the visible viewport.
+   */
+  private drawContinentsDirect() {
+    if (this.rawPolygons.length === 0) return;
+    const halfW = this.viewportWidthDeg / 2;
+
+    for (const poly of this.rawPolygons) {
+      if (poly.length < 3) continue;
+
+      // Quick visibility check: skip polygons entirely outside viewport
+      let anyVisible = false;
+      for (let k = 0; k < poly.length; k += Math.max(1, Math.floor(poly.length / 8))) {
+        let relLon = poly[k][0] - this.viewportLon;
+        while (relLon > 180) relLon -= 360;
+        while (relLon < -180) relLon += 360;
+        if (Math.abs(relLon) < halfW + 20) { anyVisible = true; break; }
+      }
+      if (!anyVisible) continue;
+
+      this.ctx.beginPath();
+      const p0 = this.lonLatToCanvas(poly[0][0], poly[0][1]);
+      this.ctx.moveTo(p0.x, p0.y);
+      for (let i = 1; i < poly.length; i++) {
+        const pt = this.lonLatToCanvas(poly[i][0], poly[i][1]);
+        this.ctx.lineTo(pt.x, pt.y);
+      }
+      this.ctx.closePath();
+      this.ctx.fillStyle = 'rgba(0, 4, 10, 0.012)';
+      this.ctx.fill();
     }
   }
 
