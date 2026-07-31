@@ -32,13 +32,12 @@ export class App implements AfterViewInit, OnDestroy {
   private windGrid: { u: number, v: number }[][] = [];
   private gridCols = 13;
   private gridRows = 13;
-  private keyBuffer = '';
-  private mapVisible = false;
-  private mapOpacity = 0;
+
   private continentPaths: { x: number, y: number }[][] = [];
   private mountainRanges: { x: number, y: number }[][] = [];
   private windRefreshTimer: ReturnType<typeof setInterval> | null = null;
   private pressureGrid: number[][] = [];
+  private baseWindGrid: { u: number, v: number }[][] = []; // Reference for evolution
   private dataReady = false;
   private deflectionPaths: { x: number, y: number }[][] = [];
   private orographicBarriers: { points: { x: number, y: number }[], strength: number }[] = [];
@@ -148,16 +147,7 @@ export class App implements AfterViewInit, OnDestroy {
     }
   }
 
-  @HostListener('window:keydown', ['$event'])
-  onKeyDown(event: KeyboardEvent) {
-    if (event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement) return;
-    this.keyBuffer += event.key.toLowerCase();
-    if (this.keyBuffer.length > 10) this.keyBuffer = this.keyBuffer.slice(-10);
-    if (this.keyBuffer.endsWith('map')) {
-      this.mapVisible = !this.mapVisible;
-      this.keyBuffer = '';
-    }
-  }
+
 
   @HostListener('window:mouseout')
   onMouseOut() {
@@ -213,6 +203,7 @@ export class App implements AfterViewInit, OnDestroy {
           this.pressureGrid.push(pressRow);
         }
         this.dataReady = true;
+        this.baseWindGrid = this.windGrid.map(row => row.map(cell => ({ u: cell.u, v: cell.v })));
         console.log(`[Elkwire] Real-time wind data loaded: ${this.gridRows}×${this.gridCols} grid`);
       } else {
         console.warn('[Elkwire] Unexpected API response, using fallback.');
@@ -355,6 +346,7 @@ export class App implements AfterViewInit, OnDestroy {
       this.pressureGrid.push(pressRow);
     }
     this.dataReady = true;
+    this.baseWindGrid = this.windGrid.map(row => row.map(cell => ({ u: cell.u, v: cell.v })));
     console.log('[Elkwire] Atmospheric model with monsoon circulation initialized.');
   }
 
@@ -366,64 +358,41 @@ export class App implements AfterViewInit, OnDestroy {
     if (!this.dataReady || this.windGrid.length === 0) return;
 
     const hour = new Date().getHours() + new Date().getMinutes() / 60;
-    const month = new Date().getMonth();
-    // Diurnal factor: monsoon intensifies in afternoon (12-18h local), weakens at night
-    const diurnalFactor = 0.85 + 0.15 * Math.sin((hour - 6) * Math.PI / 12);
-    // Pressure drift: mid-latitude systems move east at ~0.5°/evolution-step
-    const driftLon = 0.5; // degrees per evolution step (~60s)
+    // Diurnal factor: subtle modulation (±8%)
+    const diurnalFactor = 0.92 + 0.08 * Math.sin((hour - 6) * Math.PI / 12);
+    // Pressure drift: mid-latitude systems move east
+    const driftLon = 0.3;
 
+    // Use base wind as reference to prevent compounding
+    const ref = this.baseWindGrid.length > 0 ? this.baseWindGrid : this.windGrid;
     const newGrid: { u: number, v: number }[][] = [];
-    const newPressure: number[][] = [];
 
     for (let i = 0; i < this.gridRows; i++) {
       const windRow: { u: number, v: number }[] = [];
-      const pressRow: number[] = [];
       const lat = 90 - i * (180 / (this.gridRows - 1));
 
       for (let j = 0; j < this.gridCols; j++) {
-        // Mid-latitude pressure systems drift eastward
-        // Tropical systems are more stationary
         const latFactor = Math.abs(lat) > 25 ? 1.0 : 0.2;
         const srcJ = j - Math.round(driftLon / (360 / this.gridCols) * latFactor);
         const wrappedJ = ((srcJ % this.gridCols) + this.gridCols) % this.gridCols;
 
-        const oldWind = this.windGrid[i][wrappedJ];
-        const oldPressure = this.pressureGrid[i]?.[wrappedJ] ?? 1013.25;
+        const baseWind = ref[i][wrappedJ];
+        let u = baseWind.u * diurnalFactor;
+        let v = baseWind.v * diurnalFactor;
 
-        // Apply diurnal modulation to tropical winds (monsoon regions)
-        let u = oldWind.u;
-        let v = oldWind.v;
-        if (Math.abs(lat) < 30) {
-          u *= diurnalFactor;
-          v *= diurnalFactor;
-        }
-
-        // Derive geostrophic correction from pressure gradients
-        if (i > 0 && i < this.gridRows - 1 && j > 0 && j < this.gridCols - 1) {
-          const pN = this.pressureGrid[i - 1]?.[j] ?? oldPressure;
-          const pS = this.pressureGrid[i + 1]?.[j] ?? oldPressure;
-          const pW = this.pressureGrid[i]?.[j - 1] ?? oldPressure;
-          const pE = this.pressureGrid[i]?.[j + 1] ?? oldPressure;
-          // Geostrophic: wind perpendicular to pressure gradient, scaled by Coriolis
-          const f = 2 * 7.292e-5 * Math.sin(lat * Math.PI / 180);
-          if (Math.abs(f) > 1e-6) {
-            const dpdy = (pS - pN) * 0.01; // pressure gradient (meridional)
-            const dpdx = (pE - pW) * 0.01; // pressure gradient (zonal)
-            // Blend 5% geostrophic correction into existing wind
-            u += (-dpdy / f) * 0.05;
-            v += (dpdx / f) * 0.05;
-          }
+        // Cap wind magnitude to prevent runaway
+        const mag = Math.sqrt(u * u + v * v);
+        if (mag > 4.0) {
+          u *= 4.0 / mag;
+          v *= 4.0 / mag;
         }
 
         windRow.push({ u, v });
-        pressRow.push(oldPressure);
       }
       newGrid.push(windRow);
-      newPressure.push(pressRow);
     }
 
     this.windGrid = newGrid;
-    this.pressureGrid = newPressure;
   }
 
   private initCanvas() {
@@ -866,7 +835,7 @@ export class App implements AfterViewInit, OnDestroy {
         ctx.lineTo(path[i].x, path[i].y);
       }
       ctx.closePath();
-      ctx.fillStyle = 'rgba(0, 4, 10, 0.012)';
+      ctx.fillStyle = 'rgba(0, 4, 10, 0.04)';
       ctx.fill();
     }
 
@@ -911,7 +880,7 @@ export class App implements AfterViewInit, OnDestroy {
         this.ctx.lineTo(pt.x, pt.y);
       }
       this.ctx.closePath();
-      this.ctx.fillStyle = 'rgba(0, 4, 10, 0.012)';
+      this.ctx.fillStyle = 'rgba(0, 4, 10, 0.04)';
       this.ctx.fill();
     }
   }
