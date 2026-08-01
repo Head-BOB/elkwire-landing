@@ -628,8 +628,13 @@ export class App implements AfterViewInit, OnDestroy {
       p.y += p.vy;
       p.life--;
 
-      // Mobile: wrap particles at horizontal edges for infinite scroll
+      // Mobile: shift particle screen coordinates to stay locked to the panning world
       if (this.isMobileViewport) {
+        const panShiftPx = (0.015 / this.viewportWidthDeg) * this.width;
+        p.x -= panShiftPx;
+        p.lastX -= panShiftPx;
+        
+        // wrap particles at horizontal edges for infinite scroll
         if (p.x < -20) { p.x += this.width + 40; p.lastX = p.x; }
         else if (p.x > this.width + 20) { p.x -= this.width + 40; p.lastX = p.x; }
       }
