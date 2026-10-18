@@ -1,4 +1,4 @@
-// Builds public/data/elevation.bin from AWS Terrain Tiles ("terrarium", zoom 6).
+// Builds public/data/elevation.bin.gz (gzip of the binary described below) from AWS Terrain Tiles ("terrarium", zoom 6).
 // Source: https://registry.opendata.aws/terrain-tiles/  (attribution list in THIRD_PARTY_NOTICES.md)
 //
 // Why terrarium: no auth, plain PNG (no GDAL/netCDF toolchain), global composite of SRTM/GMTED/ETOPO1/
@@ -13,7 +13,7 @@
 //    lon = -179.9 + 0.2 i, lat = 89.9 - 0.2 j. Rows run north -> south. Longitude wraps, latitude clamps.
 //  - Mercator tiles stop at +-85.0511 deg; rows beyond are copied from the nearest covered row.
 //
-// Shipped asset public/data/elevation.bin: ONE plane, mean elevation (ocean pixels counted as 0 so coasts
+// Shipped asset public/data/elevation.bin.gz (gzipped): ONE plane, mean elevation (ocean pixels counted as 0 so coasts
 // are not biased by bathymetry), quantized to QUANT metres, int16 with row-wise horizontal deltas
 // (wrapping) to help gzip. Quantizing to 8 m is irrelevant for a 1000..4000 m smoothstep.
 //   "ELKE" | u8 version | u16 nx | u16 ny | f32 lon0 lat0 dlon dlat | f32 quant | mean i16[]
@@ -161,10 +161,11 @@ const q = Int16Array.from(mean, (v) => Math.round(v / QUANT));
 const dm = deltaRows16(q);
 const out = Buffer.concat([head, Buffer.from(dm.buffer, dm.byteOffset, dm.byteLength)]);
 mkdirSync('public/data', { recursive: true });
-writeFileSync('public/data/elevation.bin', out);
+const gz = gzipSync(out, { level: 9 });
+writeFileSync('public/data/elevation.bin.gz', gz);
 
 mkdirSync('test/fixtures', { recursive: true });
 const verify = Buffer.concat([Buffer.from(max.buffer, max.byteOffset, max.byteLength), Buffer.from(land)]);
 writeFileSync('test/fixtures/elevation-verify.bin.gz', gzipSync(verify, { level: 9 }));
-console.log(`elevation.bin: ${NX}x${NY}, ${out.length} bytes (${gzipSync(out, { level: 9 }).length} gzipped)`);
+console.log(`elevation.bin.gz: ${NX}x${NY}, ${out.length} bytes raw, ${gz.length} gzipped`);
 console.log(`elevation-verify.bin.gz: ${gzipSync(verify, { level: 9 }).length} bytes`);

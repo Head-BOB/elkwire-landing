@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { decodeLand } from '../../src/app/geo/land';
 import { readArrayBuffer } from './helpers';
 
-const rings = decodeLand(readArrayBuffer('public/data/land.bin'));
+const rings = decodeLand(readArrayBuffer('public/data/land.bin.gz'));
 
 describe('land.bin (Natural Earth 1:50m)', () => {
   it('decodes rings with sane coordinates', () => {

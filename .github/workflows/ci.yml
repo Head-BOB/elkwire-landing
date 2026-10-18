@@ -38,8 +38,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          curl -fsS "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/wind-data/wind.bin" -o wind.bin
-          ref=$(od -An -t u4 -j 26 -N 4 wind.bin | tr -d ' ')
+          curl -fsS "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/wind-data/wind.bin.gz" -o wind.bin.gz
+          ref=$(gunzip -c wind.bin.gz | od -An -t u4 -j 26 -N 4 | tr -d ' ')
           age=$(( $(date +%s) - ref ))
           echo "wind snapshot age: $((age / 3600)) h"
           if [ "$age" -gt $((36 * 3600)) ]; then

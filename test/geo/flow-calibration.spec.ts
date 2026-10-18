@@ -15,7 +15,7 @@ let terrain: Terrain;
 
 beforeAll(async () => {
   sampler = new WindSampler(decodeWind(readArrayBuffer('test/fixtures/wind-calibration.bin')));
-  terrain = await Terrain.build(decodeElevation(readArrayBuffer('public/data/elevation.bin')), noYield);
+  terrain = await Terrain.build(decodeElevation(readArrayBuffer('public/data/elevation.bin.gz')), noYield);
 });
 
 function newSpeeds(): number[] {

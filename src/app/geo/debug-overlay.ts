@@ -1,6 +1,7 @@
 import { decodeElevation, type ElevationGrid } from './terrain';
 import { decodeLand, type LandRings } from './land';
 import { Projection, wrapLon } from './projection';
+import { fetchBinary } from './fetch-bin';
 import { WindSampler, decodeWind } from './wind';
 
 /**
@@ -82,7 +83,7 @@ export interface DebugOverlay {
 
 export async function mountDebugOverlay(opts: { getProjection: () => Projection; host: HTMLElement; mainCanvas: HTMLCanvasElement }): Promise<DebugOverlay> {
   const [landBuf, demBuf, windBuf] = await Promise.all(
-    ['/data/land.bin', '/data/elevation.bin', '/data/wind.bin'].map((u) => fetch(u).then((r) => r.arrayBuffer())),
+    ['/data/land.bin.gz', '/data/elevation.bin.gz', '/data/wind.bin.gz'].map((u) => fetchBinary(u)),
   );
   const land: LandRings = decodeLand(landBuf);
   const dem = decodeElevation(demBuf);

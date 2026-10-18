@@ -6,7 +6,7 @@ let terrain: Terrain;
 const s = { bw: 0, nE: 0, nN: 0 };
 
 beforeAll(async () => {
-  terrain = await Terrain.build(decodeElevation(readArrayBuffer('public/data/elevation.bin')), noYield);
+  terrain = await Terrain.build(decodeElevation(readArrayBuffer('public/data/elevation.bin.gz')), noYield);
 });
 
 /** Strongest barrier weight within `r` degrees of a point. */

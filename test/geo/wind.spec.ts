@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { WindSampler, decodeWind } from '../../src/app/geo/wind';
 import { readArrayBuffer } from './helpers';
 
-const WIND_FILE = process.env['WIND_FILE'] ?? 'public/data/wind.bin';
+const WIND_FILE = process.env['WIND_FILE'] ?? 'public/data/wind.bin.gz';
 const field = decodeWind(readArrayBuffer(WIND_FILE));
 const sampler = new WindSampler(field);
 const o = { u: 0, v: 0 };

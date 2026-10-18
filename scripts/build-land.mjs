@@ -1,4 +1,4 @@
-// Builds public/data/land.bin from Natural Earth 1:50m land (world-atlas, public domain).
+// Builds public/data/land.bin.gz (gzip of the binary described below) from Natural Earth 1:50m land (world-atlas, public domain).
 //
 // CONVENTION (source): lon -180..180, lat north-positive, planar lon/lat coordinates quantized on a
 // lattice (scale 0.0036 deg lon, 0.001736 deg lat, origin -180 / -89.999). The topology is NOT cut at
@@ -15,6 +15,7 @@
 //       per ring: varint nPts, then nPts * (varint zz(dx), varint zz(dy)); first delta is from (0,0).
 import { createRequire } from 'node:module';
 import { writeFileSync, mkdirSync } from 'node:fs';
+import { gzipSync } from 'node:zlib';
 import { feature } from 'topojson-client';
 
 const require = createRequire(import.meta.url);
@@ -129,9 +130,11 @@ head.writeDoubleLE(sy, 29);
 head.writeUInt32LE(rings.length, 37);
 
 mkdirSync('public/data', { recursive: true });
-writeFileSync('public/data/land.bin', Buffer.concat([head, Buffer.from(body)]));
+const raw = Buffer.concat([head, Buffer.from(body)]);
+const gz = gzipSync(raw, { level: 9 });
+writeFileSync('public/data/land.bin.gz', gz);
 console.log(
-  `land.bin: ${rings.length} rings, ${pts} points, ${head.length + body.length} bytes; ` +
+  `land.bin.gz: ${rings.length} rings, ${pts} points, ${raw.length} bytes raw, ${gz.length} gzipped; ` +
     `${windingRings} polar-closed, ${droppedPoleLines} pole line(s) dropped, max segment ${maxSeg.toFixed(3)} deg`,
 );
 if (maxSeg > 180 + 1e-6) throw new Error('segment spans more than 180 degrees');

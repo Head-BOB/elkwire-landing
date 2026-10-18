@@ -29,7 +29,7 @@ jobs:
       - run: pip install -r scripts/gfs/requirements.txt
       # 6 tries x 120 s per file: a 404 (cycle not published yet) is retried, then AWS, then an older cycle.
       - name: Fetch and encode GFS wind
-        run: python -I scripts/gfs/fetch_gfs.py --out public/data/wind.bin --tries 6 --delay 120
+        run: python -I scripts/gfs/fetch_gfs.py --out public/data/wind.bin.gz --tries 6 --delay 120
       - uses: actions/setup-node@v4
         with:
           node-version: 20
@@ -43,24 +43,24 @@ jobs:
         run: python -I scripts/gfs/fetch_gfs.py --frames 1 --out "$RUNNER_TEMP/unused.bin" --verify-out test/fixtures/gfs-verify-1p00.bin --tries 6 --delay 120
       - name: Verify the new wind file and the end-to-end georeferencing
         env:
-          WIND_FILE: public/data/wind.bin
+          WIND_FILE: public/data/wind.bin.gz
         run: npx vitest run -c vitest.geo.config.ts test/geo/wind.spec.ts test/geo/alignment.spec.ts
-      - name: Size guard (gzipped must stay under 1 MB)
+      - name: Size guard (must stay under 1 MB)
         run: |
-          size=$(gzip -9 -c public/data/wind.bin | wc -c)
-          echo "wind.bin gzipped: $size bytes"
+          size=$(wc -c < public/data/wind.bin.gz)
+          echo "wind.bin.gz: $size bytes"
           test "$size" -lt 1048576
       - name: Publish to the single-commit wind-data branch
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           out=$(mktemp -d)
-          cp public/data/wind.bin "$out/wind.bin"
+          cp public/data/wind.bin.gz "$out/wind.bin.gz"
           cd "$out"
           git init -q -b wind-data
           git config user.name "elkwire-wind-bot"
           git config user.email "wind-bot@users.noreply.github.com"
-          git add wind.bin
+          git add wind.bin.gz
           git commit -q -m "wind: GFS snapshot $(date -u +%Y-%m-%dT%H:%MZ)"
           git push -q --force "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" wind-data
       - name: Trigger Vercel production deploy

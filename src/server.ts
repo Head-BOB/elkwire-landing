@@ -32,6 +32,10 @@ app.use(
     maxAge: '1y',
     index: false,
     redirect: false,
+    // Data files (wind refreshes every few hours) keep the same URL: always revalidate them.
+    setHeaders: (res, path) => {
+      if (path.includes('/data/')) res.setHeader('Cache-Control', 'public, max-age=0, must-revalidate');
+    },
   }),
 );
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fetch NOAA GFS 10 m wind and write the compact browser file public/data/wind.bin.
+"""Fetch NOAA GFS 10 m wind and write the compact browser file public/data/wind.bin.gz.
 
 SOURCE CONVENTION (GFS 0.5 deg shown, 1 deg is identical in layout; verified on live files): Ni=720 columns, lon 0..359.5 (the 360
 column is NOT repeated), Nj=361 rows, lat 90..-90 (north to south, jScansPositively=0), values at grid
@@ -8,7 +8,7 @@ NODES (not cell centres). u/v are m/s, positive east / north.
 OUTPUT CONVENTION: node-centred, columns rotated so longitude starts at -180 (-180..179.5), rows north to
 south (lat 90..-90). Readers wrap between the last and the first column and clamp at the poles.
 
-wind.bin layout (little endian):
+wind.bin layout (little endian; the shipped file is this, gzipped with mtime=0 so it is reproducible):
   "ELKW" | u8 version=1 | u8 nFrames | u16 nx | u16 ny
   f32 lon0 | f32 lat0 | f32 dlon | f32 dlat          (dlat is negative: rows run north to south)
   u32 refTime (unix s, model cycle) | f32 step (m/s per int16 unit)
@@ -21,6 +21,7 @@ grid are written for the alignment tests; they are never shipped to the browser.
 """
 import argparse
 import datetime as dt
+import gzip
 import os
 import struct
 import sys
@@ -161,14 +162,15 @@ def write_wind(path, grid, ref, steps, frames, quant):
     header += b"".join(struct.pack("<I", int(ref.timestamp()) + s * 3600) for s in steps)
     body = b"".join(delta16(f[k], quant).tobytes() for f in frames for k in ("10u", "10v"))
     os.makedirs(os.path.dirname(path), exist_ok=True)
+    raw = header + body
     with open(path, "wb") as fh:
-        fh.write(header + body)
-    return len(header) + len(body)
+        fh.write(gzip.compress(raw, 9, mtime=0))
+    return len(raw)
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--out", default="public/data/wind.bin")
+    ap.add_argument("--out", default="public/data/wind.bin.gz")
     ap.add_argument("--res", default="1p00", choices=["0p50", "1p00"])
     ap.add_argument("--frames", type=int, default=5, help="3-hourly frames starting at f000 (5 -> f000..f012)")
     ap.add_argument("--quant", type=float, default=0.1, help="m/s per int16 unit")
@@ -201,9 +203,8 @@ def main():
     assert ref == cycle
     sanity(frames[0]["10u"], frames[0]["10v"], grid)
     size = write_wind(a.out, grid, ref, steps, frames, a.quant)
-    import gzip
-    gz = len(gzip.compress(open(a.out, "rb").read(), 9))
-    print(f"wrote {a.out}: {size} bytes, {gz} gzipped, {grid['nx']}x{grid['ny']}, {len(frames)} frames, ref {ref:%Y-%m-%dT%H:%MZ}")
+    gz = os.path.getsize(a.out)
+    print(f"wrote {a.out}: {size} bytes raw, {gz} gzipped, {grid['nx']}x{grid['ny']}, {len(frames)} frames, ref {ref:%Y-%m-%dT%H:%MZ}")
 
     if a.verify_out:
         fields, g2, _ = decode(fetch_grib(a.res, cycle, 0, "static", a.tries, a.delay))

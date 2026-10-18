@@ -9,6 +9,7 @@ import {
   inject,
 } from '@angular/core';
 import { FlowField } from './geo/flow-bake';
+import { fetchBinary } from './geo/fetch-bin';
 import { LandRings, decodeLand, drawLandLayer, renderLandLayer } from './geo/land';
 import { Projection } from './geo/projection';
 import { Terrain, decodeElevation } from './geo/terrain';
@@ -152,9 +153,7 @@ export class App {
   private async loadFlowData() {
     await this.loadWind();
     try {
-      const response = await fetch('/data/elevation.bin');
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      this.terrain = await Terrain.build(decodeElevation(await response.arrayBuffer()));
+      this.terrain = await Terrain.build(decodeElevation(await fetchBinary('/data/elevation.bin.gz')));
       this.flow?.bakeAll(this.windSampler, this.terrain);
     } catch (e) {
       console.warn('[Elkwire] Terrain data unavailable, no orographic deflection.', e);
@@ -164,9 +163,7 @@ export class App {
   /** Load NOAA GFS wind. On any failure the last good field stays; nothing is ever synthesised. */
   private async loadWind() {
     try {
-      const response = await fetch('/data/wind.bin', { cache: 'no-cache' });
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      const sampler = new WindSampler(decodeWind(await response.arrayBuffer()));
+      const sampler = new WindSampler(decodeWind(await fetchBinary('/data/wind.bin.gz', { cache: 'no-cache' })));
       sampler.setTime(Date.now() / 1000);
       this.windSampler = sampler;
       this.lastBake = performance.now();
@@ -345,9 +342,7 @@ export class App {
 
   private async loadLand() {
     try {
-      const response = await fetch('/data/land.bin');
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      this.landRings = decodeLand(await response.arrayBuffer());
+      this.landRings = decodeLand(await fetchBinary('/data/land.bin.gz'));
       this.rebuildLandLayer();
     } catch (e) {
       console.warn('[Elkwire] Failed to load land data, map feature unavailable.', e);

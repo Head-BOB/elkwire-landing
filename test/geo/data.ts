@@ -4,12 +4,12 @@ import { readArrayBuffer, readGunzipped } from './helpers';
 import type { GridSpec } from './raster';
 
 export function loadLand(): LandRings {
-  return decodeLand(readArrayBuffer('public/data/land.bin'));
+  return decodeLand(readArrayBuffer('public/data/land.bin.gz'));
 }
 
 /** Shipped mean-elevation grid (0.2 deg, CELL-centred). */
 export function loadDem(): ElevationGrid {
-  return decodeElevation(readArrayBuffer('public/data/elevation.bin'));
+  return decodeElevation(readArrayBuffer('public/data/elevation.bin.gz'));
 }
 
 export function demSpec(g: ElevationGrid): GridSpec {

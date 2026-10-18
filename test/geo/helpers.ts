@@ -4,8 +4,10 @@ import { join } from 'node:path';
 
 const root = join(__dirname, '..', '..');
 
+/** Read a file; `.gz` files are inflated (the shipped data files are stored gzipped). */
 export function readArrayBuffer(rel: string): ArrayBuffer {
-  const b = readFileSync(join(root, rel));
+  let b = readFileSync(join(root, rel));
+  if (rel.endsWith('.gz')) b = gunzipSync(b);
   return b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength) as ArrayBuffer;
 }
 
