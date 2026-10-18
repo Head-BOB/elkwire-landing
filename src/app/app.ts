@@ -59,6 +59,7 @@ export class App implements AfterViewInit, OnDestroy {
     this.loadLand();
     this.animateText();
     this.lastFrameTime = performance.now();
+    if (new URLSearchParams(location.search).get('debug') === '1') this.mountDebug();
     // Wind and terrain load after first paint so they never delay the hero text.
     this.ngZone.runOutsideAngular(() => {
       setTimeout(() => this.loadFlowData(), 400);
@@ -100,6 +101,16 @@ export class App implements AfterViewInit, OnDestroy {
     this.mouse.targetY = -1000;
   }
 
+  /** ?debug=1: alignment overlay (lazy chunk, never part of the normal bundle). */
+  private async mountDebug() {
+    const { mountDebugOverlay } = await import('./geo/debug-overlay');
+    await mountDebugOverlay({
+      getProjection: () => this.proj,
+      host: document.body,
+      mainCanvas: this.canvasRef.nativeElement,
+    });
+  }
+
   private async loadFlowData() {
     await this.loadWind();
     try {
@@ -134,10 +145,16 @@ export class App implements AfterViewInit, OnDestroy {
     this.height = window.innerHeight;
     
     // Desktop: static view centred on 30E. Mobile: starts at 0E and pans (see renderLoop).
+    // ?debug=1&lon=..&latN=..&latS=.. override the framing so the antimeridian and poles can be inspected.
+    const q = new URLSearchParams(location.search);
+    const dbg = q.get('debug') === '1';
+    const num = (k: string) => (dbg && q.has(k) ? Number(q.get(k)) : undefined);
     this.proj = new Projection({
       width: this.width,
       height: this.height,
-      centerLon: this.isMobileViewport ? this.proj?.centerLon ?? 0 : 30,
+      centerLon: num('lon') ?? (this.isMobileViewport ? this.proj?.centerLon ?? 0 : 30),
+      latN: num('latN'),
+      latS: num('latS'),
     });
     this.flow = new FlowField(this.proj);
     if (this.windSampler) this.flow.bakeAll(this.windSampler, this.terrain);
