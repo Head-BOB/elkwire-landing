@@ -1,0 +1,49 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: '17 6 * * *' # daily staleness watchdog for the wind data
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  build:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+        env:
+          SKIP_WIND_FETCH: '1'
+      - run: npm run lint
+      - run: npm test
+      - run: npm run build
+        env:
+          SKIP_WIND_FETCH: '1'
+
+  wind-freshness:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail (and open an issue) if the published wind snapshot is older than 36 h
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          curl -fsS "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/wind-data/wind.bin" -o wind.bin
+          ref=$(od -An -t u4 -j 26 -N 4 wind.bin | tr -d ' ')
+          age=$(( $(date +%s) - ref ))
+          echo "wind snapshot age: $((age / 3600)) h"
+          if [ "$age" -gt $((36 * 3600)) ]; then
+            gh issue create --label wind-data --title "wind data is stale ($((age / 3600)) h old)" \
+              --body "The wind-data branch snapshot is older than 36 h. Check the wind-data workflow and whether scheduled workflows were disabled (GitHub disables them after 60 days of repo inactivity)."
+            exit 1
+          fi

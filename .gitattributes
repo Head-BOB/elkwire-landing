@@ -1,0 +1,2 @@
+public/data/*.bin binary
+test/fixtures/*.bin binary

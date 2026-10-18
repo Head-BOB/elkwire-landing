@@ -9,7 +9,11 @@
     "watch": "ng build --watch --configuration development",
     "test": "ng test",
     "lint": "ng lint",
-    "serve:ssr:app": "node dist/app/server/server.mjs"
+    "serve:ssr:app": "node dist/app/server/server.mjs",
+    "prebuild": "node scripts/fetch-wind-branch.mjs",
+    "data:land": "node scripts/build-land.mjs",
+    "data:terrain": "node scripts/build-terrain.mjs",
+    "data:wind": "python3 -I scripts/gfs/fetch_gfs.py"
   },
   "private": true,
   "dependencies": {
@@ -41,8 +45,10 @@
     "pngjs": "^7.0.0",
     "postcss": "^8.5.3",
     "tailwindcss": "^4.1.12",
+    "topojson-client": "^3.1.0",
     "typescript": "~5.9.2",
     "typescript-eslint": "8.47.0",
-    "vitest": "^4.0.0"
+    "vitest": "^4.0.0",
+    "world-atlas": "^2.0.2"
   }
 }
