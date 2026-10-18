@@ -1,23 +1,20 @@
-import { ChangeDetectionStrategy, Component, ElementRef, ViewChild, AfterViewInit, OnDestroy, NgZone, HostListener, inject } from '@angular/core';
-import { Projection } from './geo/projection';
-import { decodeLand, drawLandLayer, renderLandLayer, LandRings } from './geo/land';
+import {
+  ChangeDetectionStrategy,
+  Component,
+  DestroyRef,
+  ElementRef,
+  NgZone,
+  ViewChild,
+  afterNextRender,
+  inject,
+} from '@angular/core';
 import { FlowField } from './geo/flow-bake';
+import { LandRings, decodeLand, drawLandLayer, renderLandLayer } from './geo/land';
+import { Projection } from './geo/projection';
 import { Terrain, decodeElevation } from './geo/terrain';
 import { WindSampler, decodeWind } from './geo/wind';
-
-interface Particle {
-  x: number;
-  y: number;
-  lastX: number;
-  lastY: number;
-  vx: number;
-  vy: number;
-  life: number;
-  maxLife: number;
-  size: number;
-  color: string;
-  baseColor: string;
-}
+import { CurlNoise } from './sim/noise';
+import { ParticleSystem } from './sim/particles';
 
 @Component({
   changeDetection: ChangeDetectionStrategy.OnPush,
@@ -26,11 +23,12 @@ interface Particle {
   styleUrl: './app.css',
   standalone: true,
 })
-export class App implements AfterViewInit, OnDestroy {
+export class App {
   @ViewChild('canvasElement') canvasRef!: ElementRef<HTMLCanvasElement>;
   private ctx!: CanvasRenderingContext2D;
   private animationFrameId = 0;
-  private particles: Particle[] = [];
+  private particles!: ParticleSystem;
+  private readonly noise = new CurlNoise();
   private mouse = { x: -1000, y: -1000, targetX: -1000, targetY: -1000 };
   private width = 0;
   private height = 0;
@@ -45,61 +43,101 @@ export class App implements AfterViewInit, OnDestroy {
   private isTouchDevice = false;
   // Mobile viewport: show portion of world, slowly scroll
   private isMobileViewport = false;
-  private lastFrameTime = 0;
+  private reducedMotion = false;
+  private resizeTimer: ReturnType<typeof setTimeout> | null = null;
+  private resizeObserver: ResizeObserver | null = null;
+  private running = false;
+  // Adaptive quality: a safety net that only acts when frames really miss the target.
+  private adaptive = true;
+  private frameEma = 0;
+  private lastFrameAt = 0;
+  private slowStreak = 0;
+  private fastStreak = 0;
 
   /** Mobile pan: 0.015 deg/frame on the old 180-deg-tall stretched map = 0.015/180 px per frame per px of height. */
   private static readonly PAN_PX_PER_FRAME_PER_PX_HEIGHT = 0.015 / 180;
 
   private ngZone = inject(NgZone);
+  private destroyRef = inject(DestroyRef);
 
-  ngAfterViewInit() {
+  constructor() {
+    // Runs in the browser only, after the first render: SSR never touches window/canvas.
+    afterNextRender(() => this.init());
+  }
+
+  private init() {
     this.isTouchDevice = 'ontouchstart' in window || navigator.maxTouchPoints > 0;
     this.isMobileViewport = this.isTouchDevice && window.innerWidth < 900;
+    this.reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    const params = new URLSearchParams(location.search);
+    this.adaptive = params.get('aq') !== '0';
     this.initCanvas();
     this.loadLand();
     this.animateText();
-    this.lastFrameTime = performance.now();
-    if (new URLSearchParams(location.search).get('debug') === '1') this.mountDebug();
-    // Wind and terrain load after first paint so they never delay the hero text.
+    if (params.get('debug') === '1') this.mountDebug();
+
     this.ngZone.runOutsideAngular(() => {
+      // Input and layout events never trigger change detection and never block scrolling.
+      const opts: AddEventListenerOptions = { passive: true };
+      window.addEventListener('mousemove', this.onMouseMove, opts);
+      window.addEventListener('mouseout', this.onMouseOut, opts);
+      document.addEventListener('visibilitychange', this.onVisibility, opts);
+      this.resizeObserver = new ResizeObserver(() => {
+        if (Math.round(window.innerWidth) === this.width && Math.round(window.innerHeight) === this.height) return;
+        // Debounced: the old frame simply stays CSS-scaled until the burst of resize events settles.
+        if (this.resizeTimer) clearTimeout(this.resizeTimer);
+        this.resizeTimer = setTimeout(() => this.onResize(), 150);
+      });
+      this.resizeObserver.observe(this.canvasRef.nativeElement);
+
+      // Wind and terrain load after first paint so they never delay the hero text.
       setTimeout(() => this.loadFlowData(), 400);
       this.windRefreshTimer = setInterval(() => this.loadWind(), 3 * 60 * 60 * 1000);
     });
-  }
 
-  ngOnDestroy() {
-    if (this.animationFrameId) {
+    this.destroyRef.onDestroy(() => {
+      this.running = false;
       cancelAnimationFrame(this.animationFrameId);
-    }
-    if (this.windRefreshTimer) {
-      clearInterval(this.windRefreshTimer);
-    }
+      if (this.windRefreshTimer) clearInterval(this.windRefreshTimer);
+      if (this.resizeTimer) clearTimeout(this.resizeTimer);
+      this.resizeObserver?.disconnect();
+      window.removeEventListener('mousemove', this.onMouseMove);
+      window.removeEventListener('mouseout', this.onMouseOut);
+      document.removeEventListener('visibilitychange', this.onVisibility);
+    });
   }
 
-  @HostListener('window:resize')
-  onResize() {
+  private onResize() {
     this.isMobileViewport = this.isTouchDevice && window.innerWidth < 900;
     this.initCanvas();
     this.rebuildLandLayer();
   }
 
-  @HostListener('window:mousemove', ['$event'])
-  onMouseMove(event: MouseEvent) {
+  private onMouseMove = (event: MouseEvent) => {
     this.mouse.targetX = event.clientX;
     this.mouse.targetY = event.clientY;
     if (this.mouse.x === -1000) {
       this.mouse.x = this.mouse.targetX;
       this.mouse.y = this.mouse.targetY;
     }
-  }
+  };
 
-
-
-  @HostListener('window:mouseout')
-  onMouseOut() {
+  private onMouseOut = () => {
     this.mouse.targetX = -1000;
     this.mouse.targetY = -1000;
-  }
+  };
+
+  /** Stop the loop while the tab is hidden; resume without a time jump. */
+  private onVisibility = () => {
+    if (document.hidden) {
+      this.running = false;
+      cancelAnimationFrame(this.animationFrameId);
+    } else if (!this.running) {
+      this.lastFrameAt = 0;
+      this.running = true;
+      this.animationFrameId = requestAnimationFrame(this.renderLoop);
+    }
+  };
 
   /** ?debug=1: alignment overlay (lazy chunk, never part of the normal bundle). */
   private async mountDebug() {
@@ -143,7 +181,7 @@ export class App implements AfterViewInit, OnDestroy {
     this.ctx = canvas.getContext('2d', { alpha: false })!;
     this.width = window.innerWidth;
     this.height = window.innerHeight;
-    
+
     // Desktop: static view centred on 30E. Mobile: starts at 0E and pans (see renderLoop).
     // ?debug=1&lon=..&latN=..&latS=.. override the framing so the antimeridian and poles can be inspected.
     const q = new URLSearchParams(location.search);
@@ -152,125 +190,69 @@ export class App implements AfterViewInit, OnDestroy {
     this.proj = new Projection({
       width: this.width,
       height: this.height,
-      centerLon: num('lon') ?? (this.isMobileViewport ? this.proj?.centerLon ?? 0 : 30),
+      centerLon: num('lon') ?? (this.isMobileViewport ? (this.proj?.centerLon ?? 0) : 30),
       latN: num('latN'),
       latS: num('latS'),
     });
     this.flow = new FlowField(this.proj);
     if (this.windSampler) this.flow.bakeAll(this.windSampler, this.terrain);
+    this.noise.resize(this.width, this.height);
 
     const dpr = window.devicePixelRatio || 1;
     canvas.width = this.width * dpr;
     canvas.height = this.height * dpr;
     this.ctx.scale(dpr, dpr);
-    
-    this.particles = [];
+
     const particleCount = Math.min(Math.floor((this.width * this.height) / 800), 2500);
-    
-    for (let i = 0; i < particleCount; i++) {
-      const p = {} as Particle;
-      this.resetParticle(p);
-      p.life = Math.random() * p.maxLife;
-      this.particles.push(p);
-    }
+    this.particles = new ParticleSystem(particleCount, this.width, this.height, Math.random);
+    this.slowStreak = 0;
+    this.fastStreak = 0;
 
     this.ctx.fillStyle = '#020408';
     this.ctx.fillRect(0, 0, this.width, this.height);
 
     this.ngZone.runOutsideAngular(() => {
       if (this.animationFrameId) cancelAnimationFrame(this.animationFrameId);
+      this.running = true;
+      this.lastFrameAt = 0;
       this.renderLoop();
     });
   }
 
-  private resetParticle(p: Particle) {
-    p.x = Math.random() * this.width;
-    p.y = Math.random() * this.height;
-    p.lastX = p.x;
-    p.lastY = p.y;
-    p.vx = 0;
-    p.vy = 0;
-    p.maxLife = Math.random() * 350 + 250;
-    p.life = p.maxLife;
-    const colors = [
-      'rgba(10, 45, 75, 0.6)',   // Deep oceanic blue
-      'rgba(30, 90, 120, 0.7)',  // Bathypelagic teal
-      'rgba(60, 150, 190, 0.5)', // Hydrodynamic cyan
-      'rgba(140, 200, 230, 0.3)' // Wake foam
-    ];
-    p.baseColor = colors[Math.floor(Math.random() * colors.length)];
-    p.color = p.baseColor;
-    p.size = Math.random() * 1.5 + 0.5;
-  }
-
-  private hash(x: number, y: number): number {
-    const h = Math.sin(x * 12.9898 + y * 78.233) * 43758.5453123;
-    return h - Math.floor(h);
-  }
-
-  private noise(x: number, y: number): number {
-    const iX = Math.floor(x);
-    const iY = Math.floor(y);
-    const fX = x - iX;
-    const fY = y - iY;
-
-    const u = fX * fX * (3.0 - 2.0 * fX);
-    const v = fY * fY * (3.0 - 2.0 * fY);
-
-    const a = this.hash(iX, iY);
-    const b = this.hash(iX + 1, iY);
-    const c = this.hash(iX, iY + 1);
-    const d = this.hash(iX + 1, iY + 1);
-
-    return a + u * (b - a) + v * (c - a) + u * v * (a - b - c + d);
-  }
-  
-  private fbm(x: number, y: number): number {
-    let value = 0;
-    let amplitude = 0.5;
-    for (let i = 0; i < 3; i++) {
-      value += amplitude * this.noise(x, y);
-      x *= 2.0;
-      y *= 2.0;
-      amplitude *= 0.5;
+  /**
+   * Safety net, not a feature: the particle count only drops when frames sustainably miss the target
+   * (60 fps desktop, 30 fps touch devices) and creeps back once there is plenty of headroom.
+   * Disable with ?aq=0.
+   */
+  private adapt(frameMs: number) {
+    if (!this.adaptive || frameMs > 250) return; // ignore tab-switch gaps
+    this.frameEma = this.frameEma === 0 ? frameMs : this.frameEma * 0.95 + frameMs * 0.05;
+    const target = this.isTouchDevice ? 1000 / 30 : 1000 / 60;
+    const cap = this.particles.capacity;
+    if (this.frameEma > target * 1.3) {
+      this.fastStreak = 0;
+      if (++this.slowStreak >= 120 && this.particles.active > cap * 0.4) {
+        this.particles.setActive(Math.floor(this.particles.active - cap * 0.1));
+        this.slowStreak = 0;
+        console.info(`[Elkwire] adaptive quality: ${this.particles.active}/${cap} particles (frame ${this.frameEma.toFixed(1)} ms)`);
+      }
+    } else if (this.frameEma < target * 0.8) {
+      this.slowStreak = 0;
+      if (++this.fastStreak >= 600 && this.particles.active < cap) {
+        this.particles.setActive(Math.ceil(this.particles.active + cap * 0.1));
+        this.fastStreak = 0;
+      }
+    } else {
+      this.slowStreak = 0;
+      this.fastStreak = 0;
     }
-    return value;
-  }
-
-  private getFluidVelocity(x: number, y: number, t: number): { vx: number, vy: number } {
-    const scale = 0.0012;
-    const sx = x * scale;
-    const sy = y * scale;
-    const eps = 0.01;
-
-    const n1 = this.fbm(sx, sy + eps - t);
-    const n2 = this.fbm(sx, sy - eps - t);
-    const dPsi_dy = (n1 - n2) / (2 * eps);
-
-    const n3 = this.fbm(sx + eps - t, sy);
-    const n4 = this.fbm(sx - eps - t, sy);
-    const dPsi_dx = (n3 - n4) / (2 * eps);
-
-    let u = 0;
-    let v = 0;
-
-    if (this.flow) {
-      this.flow.sample(x + this.proj.originX, y);
-      u = this.flow.sx;
-      v = this.flow.sy;
-    }
-
-    const windMag = Math.sqrt(u * u + v * v);
-    const turbulenceScale = Math.max(0.6, windMag * 0.35);
-    const curlVx = dPsi_dy * turbulenceScale;
-    const curlVy = -dPsi_dx * turbulenceScale;
-
-    return { vx: u + curlVx, vy: v + curlVy }; 
   }
 
   private renderLoop = () => {
+    if (!this.running) return;
     const now = performance.now();
-    this.lastFrameTime = now;
+    if (this.lastFrameAt) this.adapt(now - this.lastFrameAt);
+    this.lastFrameAt = now;
 
     // Smooth cursor follow
     if (this.mouse.targetX !== -1000) {
@@ -282,10 +264,9 @@ export class App implements AfterViewInit, OnDestroy {
     }
 
     // Mobile: slowly pan viewport east→west (Earth rotation)
-    if (this.isMobileViewport) {
-      // Same on-screen pan speed as before (0.015 deg/frame of the old 180-deg-tall map).
-      this.proj.panBy(App.PAN_PX_PER_FRAME_PER_PX_HEIGHT * this.height);
-    }
+    // Same on-screen pan speed as before (0.015 deg/frame of the old 180-deg-tall map).
+    const panPx = this.isMobileViewport ? App.PAN_PX_PER_FRAME_PER_PX_HEIGHT * this.height : 0;
+    if (this.isMobileViewport) this.proj.panBy(panPx);
 
     // Re-blend the forecast frames against the real clock every 60 s (incremental, a few ms per frame).
     if (this.windSampler && now - this.lastBake > 60000) {
@@ -303,62 +284,24 @@ export class App implements AfterViewInit, OnDestroy {
     if (this.landLayer) drawLandLayer(this.ctx, this.landLayer, this.proj);
 
     const t = now * 0.00005;
-
-    for (const p of this.particles) {
-      p.color = p.baseColor;
-
-      const fluid = this.getFluidVelocity(p.x, p.y, t);
-      let targetVx = fluid.vx * 1.5;
-      let targetVy = fluid.vy * 1.5;
-
-      // Mouse interaction (desktop only)
-      if (!this.isTouchDevice && this.mouse.x > -500) {
-        const dx = p.x - this.mouse.x;
-        const dy = p.y - this.mouse.y;
-        const dist = Math.sqrt(dx * dx + dy * dy);
-        const influence = 300;
-        if (dist < influence) {
-          const force = Math.pow((influence - dist) / influence, 2);
-          targetVx += (dx / dist) * force * 5;
-          targetVy += (dy / dist) * force * 5;
-          targetVx += -(dy / dist) * force * 3;
-          targetVy += (dx / dist) * force * 3;
-        }
-      }
-
-      p.vx += (targetVx - p.vx) * 0.08;
-      p.vy += (targetVy - p.vy) * 0.08;
-      p.lastX = p.x;
-      p.lastY = p.y;
-      p.x += p.vx;
-      p.y += p.vy;
-      p.life--;
-
-      // Mobile: shift particle screen coordinates to stay locked to the panning world
-      if (this.isMobileViewport) {
-        const panShiftPx = App.PAN_PX_PER_FRAME_PER_PX_HEIGHT * this.height;
-        p.x -= panShiftPx;
-        p.lastX -= panShiftPx;
-        
-        // wrap particles at horizontal edges for infinite scroll
-        if (p.x < -20) { p.x += this.width + 40; p.lastX = p.x; }
-        else if (p.x > this.width + 20) { p.x -= this.width + 40; p.lastX = p.x; }
-      }
-
-      if (p.life <= 0 || p.x < -50 || p.x > this.width + 50 || p.y < -50 || p.y > this.height + 50 || isNaN(p.x) || isNaN(p.y)) {
-        this.resetParticle(p);
-      } else {
-        this.ctx.strokeStyle = p.color;
-        this.ctx.lineWidth = p.size;
-        this.ctx.beginPath();
-        this.ctx.moveTo(p.lastX, p.lastY);
-        this.ctx.lineTo(p.x, p.y);
-        this.ctx.stroke();
-      }
-    }
+    this.noise.prepare(t);
+    const mouseActive = !this.isTouchDevice && this.mouse.x > -500;
+    this.particles.step({
+      flow: this.flow,
+      noise: this.noise,
+      t,
+      originX: this.proj.originX,
+      mouseActive,
+      mouseX: this.mouse.x,
+      mouseY: this.mouse.y,
+      mobile: this.isMobileViewport,
+      panPx,
+      speedScale: this.reducedMotion ? 0.25 : 1,
+    });
+    this.particles.draw(this.ctx);
 
     // Cursor reticle (desktop only)
-    if (!this.isTouchDevice && this.mouse.x > -500) {
+    if (mouseActive) {
       this.ctx.strokeStyle = 'rgba(100, 160, 200, 0.2)';
       this.ctx.lineWidth = 1;
       this.ctx.beginPath();
@@ -377,6 +320,11 @@ export class App implements AfterViewInit, OnDestroy {
   };
 
   private async animateText() {
+    if (this.reducedMotion) {
+      // prefers-reduced-motion: show the text without animation (nobody else sees this branch).
+      for (const el of Array.from(document.querySelectorAll<HTMLElement>('.letter, .reveal-sub'))) el.style.opacity = '1';
+      return;
+    }
     const { animate, stagger, cubicBezier } = await import('motion');
     const easing = cubicBezier(0.16, 1, 0.3, 1);
 
