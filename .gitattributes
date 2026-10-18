@@ -1,0 +1,3 @@
+public/data/*.gz binary
+test/fixtures/*.bin binary
+test/fixtures/*.gz binary
