@@ -30,6 +30,21 @@ jobs:
       # 6 tries x 120 s per file: a 404 (cycle not published yet) is retried, then AWS, then an older cycle.
       - name: Fetch and encode GFS wind
         run: python -I scripts/gfs/fetch_gfs.py --out public/data/wind.bin --tries 6 --delay 120
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+        env:
+          SKIP_WIND_FETCH: '1'
+      # Fresh GFS surface orography + land-sea mask on the same 1 deg grid, used only to verify that the
+      # coastline, the terrain and the wind grid still line up. Never shipped to the browser.
+      - name: Fetch GFS surface HGT + LAND for verification
+        run: python -I scripts/gfs/fetch_gfs.py --frames 1 --out "$RUNNER_TEMP/unused.bin" --verify-out test/fixtures/gfs-verify-1p00.bin --tries 6 --delay 120
+      - name: Verify the new wind file and the end-to-end georeferencing
+        env:
+          WIND_FILE: public/data/wind.bin
+        run: npx vitest run -c vitest.geo.config.ts test/geo/wind.spec.ts test/geo/alignment.spec.ts
       - name: Size guard (gzipped must stay under 1 MB)
         run: |
           size=$(gzip -9 -c public/data/wind.bin | wc -c)
