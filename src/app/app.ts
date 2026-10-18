@@ -1,6 +1,9 @@
 import { ChangeDetectionStrategy, Component, ElementRef, ViewChild, AfterViewInit, OnDestroy, NgZone, HostListener, inject } from '@angular/core';
 import { Projection } from './geo/projection';
 import { decodeLand, drawLandLayer, renderLandLayer, LandRings } from './geo/land';
+import { FlowField } from './geo/flow-bake';
+import { Terrain, decodeElevation } from './geo/terrain';
+import { WindSampler, decodeWind } from './geo/wind';
 
 interface Particle {
   x: number;
@@ -31,23 +34,17 @@ export class App implements AfterViewInit, OnDestroy {
   private mouse = { x: -1000, y: -1000, targetX: -1000, targetY: -1000 };
   private width = 0;
   private height = 0;
-  private windGrid: { u: number, v: number }[][] = [];
-  private gridCols = 13;
-  private gridRows = 13;
-
   private windRefreshTimer: ReturnType<typeof setInterval> | null = null;
-  private pressureGrid: number[][] = [];
-  private baseWindGrid: { u: number, v: number }[][] = []; // Reference for evolution
-  private dataReady = false;
+  private flow: FlowField | null = null;
+  private windSampler: WindSampler | null = null;
+  private terrain: Terrain | null = null;
+  private lastBake = 0;
   private proj!: Projection;
   private landRings: LandRings = [];
   private landLayer: HTMLCanvasElement | null = null;
   private isTouchDevice = false;
   // Mobile viewport: show portion of world, slowly scroll
   private isMobileViewport = false;
-  // Simulation evolution
-  private lastApiCall = 0;
-  private simElapsed = 0;
   private lastFrameTime = 0;
 
   /** Mobile pan: 0.015 deg/frame on the old 180-deg-tall stretched map = 0.015/180 px per frame per px of height. */
@@ -58,13 +55,15 @@ export class App implements AfterViewInit, OnDestroy {
   ngAfterViewInit() {
     this.isTouchDevice = 'ontouchstart' in window || navigator.maxTouchPoints > 0;
     this.isMobileViewport = this.isTouchDevice && window.innerWidth < 900;
-    this.fetchRealtimeWinds();
-    // API refresh: 2x per day instead of every 15min to avoid rate limits
-    this.windRefreshTimer = setInterval(() => this.fetchRealtimeWinds(), 12 * 60 * 60 * 1000);
     this.initCanvas();
     this.loadLand();
     this.animateText();
     this.lastFrameTime = performance.now();
+    // Wind and terrain load after first paint so they never delay the hero text.
+    this.ngZone.runOutsideAngular(() => {
+      setTimeout(() => this.loadFlowData(), 400);
+      this.windRefreshTimer = setInterval(() => this.loadWind(), 3 * 60 * 60 * 1000);
+    });
   }
 
   ngOnDestroy() {
@@ -101,244 +100,31 @@ export class App implements AfterViewInit, OnDestroy {
     this.mouse.targetY = -1000;
   }
 
-  private async fetchRealtimeWinds() {
+  private async loadFlowData() {
+    await this.loadWind();
     try {
-      // Smaller grid: 7 rows × 13 cols = 91 points (avoids API rate limits)
-      this.gridRows = 7;
-      this.gridCols = 13;
-      const lats: number[] = [];
-      const lons: number[] = [];
-      for (let lat = 75; lat >= -75; lat -= 25) {
-        for (let lon = -180; lon <= 180; lon += 30) {
-          lats.push(lat);
-          lons.push(lon);
-        }
-      }
-
-      const response = await fetch(
-        `https://api.open-meteo.com/v1/forecast?latitude=${lats.join(',')}&longitude=${lons.join(',')}&current=wind_speed_10m,wind_direction_10m,surface_pressure`
-      );
-      const data = await response.json();
-
-      if (Array.isArray(data) && data.length === this.gridRows * this.gridCols) {
-        let index = 0;
-        this.windGrid = [];
-        this.pressureGrid = [];
-        for (let i = 0; i < this.gridRows; i++) {
-          const windRow: { u: number, v: number }[] = [];
-          const pressRow: number[] = [];
-          for (let j = 0; j < this.gridCols; j++) {
-            const pointData = data[index]?.current;
-            if (pointData) {
-              const speed = pointData.wind_speed_10m ?? 0;
-              const dir = pointData.wind_direction_10m ?? 0;
-              const pressure = pointData.surface_pressure ?? 1013.25;
-              const rad = dir * Math.PI / 180;
-              const normalizedSpeed = speed / 20;
-              const u = -Math.sin(rad) * normalizedSpeed;
-              const v = Math.cos(rad) * normalizedSpeed;
-              windRow.push({ u, v });
-              pressRow.push(pressure);
-            } else {
-              windRow.push({ u: 0, v: 0 });
-              pressRow.push(1013.25);
-            }
-            index++;
-          }
-          this.windGrid.push(windRow);
-          this.pressureGrid.push(pressRow);
-        }
-        this.dataReady = true;
-        this.baseWindGrid = this.windGrid.map(row => row.map(cell => ({ u: cell.u, v: cell.v })));
-        console.log(`[Elkwire] Real-time wind data loaded: ${this.gridRows}×${this.gridCols} grid`);
-      } else {
-        console.warn('[Elkwire] Unexpected API response, using fallback.');
-        this.buildFallbackGrid();
-      }
+      const response = await fetch('/data/elevation.bin');
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      this.terrain = await Terrain.build(decodeElevation(await response.arrayBuffer()));
+      this.flow?.bakeAll(this.windSampler, this.terrain);
     } catch (e) {
-      console.warn('[Elkwire] API unavailable, using atmospheric model fallback.', e);
-      this.buildFallbackGrid();
+      console.warn('[Elkwire] Terrain data unavailable, no orographic deflection.', e);
     }
   }
 
-  /**
-   * Physics-accurate atmospheric fallback with regional monsoon features.
-   * 19×25 grid for high resolution.
-   * Includes three-cell circulation + all major monsoon systems.
-   */
-  private buildFallbackGrid() {
-    this.gridRows = 19;
-    this.gridCols = 25;
-    this.windGrid = [];
-    this.pressureGrid = [];
-
-    const month = new Date().getMonth();
-    const itczShift = 8 * Math.sin((month - 3) * Math.PI / 6);
-    const monsoonStrength = Math.max(0, Math.sin((month - 4) * Math.PI / 5));
-    const winterMonsoon = Math.max(0, Math.sin((month - 10) * Math.PI / 4));
-
-    for (let i = 0; i < this.gridRows; i++) {
-      const windRow: { u: number, v: number }[] = [];
-      const pressRow: number[] = [];
-      const lat = 90 - i * 10;
-
-      for (let j = 0; j < this.gridCols; j++) {
-        const lon = -180 + j * 15;
-        const effectiveLat = lat - itczShift;
-        const absLat = Math.abs(effectiveLat);
-        const hemisphere = effectiveLat >= 0 ? 1 : -1;
-
-        let uZonal = 0;
-        let vMerid = 0;
-        let pressure = 1013.25;
-
-        // === BASE: Three-cell circulation ===
-        if (absLat < 30) {
-          const cellProgress = absLat / 30;
-          const intensity = Math.sin(cellProgress * Math.PI);
-          const coriolisScale = Math.sin(absLat * Math.PI / 180);
-          uZonal = -1.8 * intensity * (0.3 + 0.7 * coriolisScale);
-          vMerid = 0.5 * intensity * hemisphere;
-          if (absLat < 5) { uZonal *= absLat / 5; vMerid *= absLat / 5; }
-          pressure = 1008 + 14 * cellProgress;
-        } else if (absLat < 60) {
-          const cellProgress = (absLat - 30) / 30;
-          const intensity = Math.sin(cellProgress * Math.PI);
-          uZonal = 2.5 * intensity + Math.exp(-Math.pow((absLat - 30) / 5, 2)) * 0.8 + Math.exp(-Math.pow((absLat - 60) / 5, 2)) * 0.6;
-          vMerid = -0.6 * intensity * hemisphere;
-          pressure = 1022 - 17 * cellProgress;
-        } else {
-          const cellProgress = (absLat - 60) / 30;
-          const intensity = Math.sin(cellProgress * Math.PI * 0.8);
-          uZonal = -1.0 * intensity;
-          vMerid = 0.4 * intensity * hemisphere;
-          pressure = 1005 + 15 * cellProgress;
-        }
-
-        // === INDIAN SW MONSOON (Jun-Sep): Arabian Sea → Kerala/Western Ghats ===
-        if (lat >= -5 && lat <= 30 && lon >= 40 && lon <= 100 && monsoonStrength > 0) {
-          const latF = Math.sin(Math.max(0, Math.min(1, (lat + 5) / 30)) * Math.PI);
-          const lonF = Math.exp(-Math.pow((lon - 70) / 25, 2));
-          const s = monsoonStrength * latF * lonF;
-          uZonal += 2.5 * s;   // Strong westerly
-          vMerid += -1.5 * s;  // Strong northward
-          pressure -= 8 * s;
-        }
-
-        // === SOMALI JET (Jun-Sep): Cross-equatorial low-level jet ===
-        if (lat >= -5 && lat <= 15 && lon >= 40 && lon <= 55 && monsoonStrength > 0) {
-          const s = monsoonStrength * Math.exp(-Math.pow((lon - 48) / 6, 2));
-          uZonal += 1.5 * s;
-          vMerid += -2.0 * s;
-        }
-
-        // === EAST ASIAN MONSOON (Jun-Aug) ===
-        if (lat >= 10 && lat <= 40 && lon >= 100 && lon <= 140 && monsoonStrength > 0) {
-          const latF = Math.sin(Math.max(0, Math.min(1, (lat - 10) / 30)) * Math.PI);
-          const lonF = Math.exp(-Math.pow((lon - 120) / 15, 2));
-          const s = monsoonStrength * 0.7 * latF * lonF;
-          uZonal += 1.0 * s;
-          vMerid += -1.2 * s;
-        }
-
-        // === WEST AFRICAN MONSOON (Jun-Sep) ===
-        if (lat >= 0 && lat <= 20 && lon >= -20 && lon <= 20 && monsoonStrength > 0) {
-          const latF = Math.sin(Math.max(0, Math.min(1, lat / 20)) * Math.PI);
-          const lonF = Math.exp(-Math.pow(lon / 15, 2));
-          const s = monsoonStrength * 0.6 * latF * lonF;
-          uZonal += 1.2 * s;
-          vMerid += -0.8 * s;
-        }
-
-        // === WINTER NE MONSOON (Dec-Feb) over India ===
-        if (lat >= 0 && lat <= 30 && lon >= 60 && lon <= 100 && winterMonsoon > 0) {
-          const latF = Math.sin(Math.max(0, Math.min(1, lat / 30)) * Math.PI);
-          const lonF = Math.exp(-Math.pow((lon - 80) / 15, 2));
-          const s = winterMonsoon * 0.8 * latF * lonF;
-          uZonal -= 1.5 * s;
-          vMerid += 1.0 * s;
-        }
-
-        // === SUBTROPICAL HIGHS (clockwise NH, counter-clockwise SH) ===
-        // Azores/Bermuda High
-        if (lat >= 15 && lat <= 45 && lon >= -70 && lon <= 0) {
-          const dL = (lat - 32) / 15, dN = (lon - (-35)) / 20;
-          const d2 = dL * dL + dN * dN;
-          if (d2 < 1) { const s = (1 - d2) * 0.8; uZonal += dL * s * 1.5; vMerid += dN * s * 1.5; pressure += 6 * (1 - d2); }
-        }
-        // North Pacific High
-        if (lat >= 20 && lat <= 45 && lon >= -170 && lon <= -120) {
-          const dL = (lat - 35) / 15, dN = (lon - (-145)) / 20;
-          const d2 = dL * dL + dN * dN;
-          if (d2 < 1) { const s = (1 - d2) * 0.7; uZonal += dL * s * 1.3; vMerid += dN * s * 1.3; pressure += 5 * (1 - d2); }
-        }
-        // Mascarene High (drives Indian monsoon moisture)
-        if (lat >= -40 && lat <= -15 && lon >= 40 && lon <= 90 && monsoonStrength > 0) {
-          const dL = (lat + 30) / 12, dN = (lon - 65) / 20;
-          const d2 = dL * dL + dN * dN;
-          if (d2 < 1) { const s = (1 - d2) * monsoonStrength * 0.8; uZonal -= dL * s * 1.2; vMerid -= dN * s * 1.2; pressure += 4 * (1 - d2); }
-        }
-
-        // === MEDITERRANEAN ETESIAN WINDS (Jun-Sep) ===
-        if (lat >= 30 && lat <= 42 && lon >= 15 && lon <= 35 && monsoonStrength > 0) {
-          uZonal -= 0.8 * monsoonStrength * 0.5;
-          vMerid += 0.6 * monsoonStrength * 0.5;
-        }
-
-        windRow.push({ u: uZonal, v: vMerid });
-        pressRow.push(pressure);
-      }
-      this.windGrid.push(windRow);
-      this.pressureGrid.push(pressRow);
+  /** Load NOAA GFS wind. On any failure the last good field stays; nothing is ever synthesised. */
+  private async loadWind() {
+    try {
+      const response = await fetch('/data/wind.bin', { cache: 'no-cache' });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const sampler = new WindSampler(decodeWind(await response.arrayBuffer()));
+      sampler.setTime(Date.now() / 1000);
+      this.windSampler = sampler;
+      this.lastBake = performance.now();
+      this.flow?.bakeAll(this.windSampler, this.terrain);
+    } catch (e) {
+      console.warn('[Elkwire] Wind data unavailable, keeping the last good field.', e);
     }
-    this.dataReady = true;
-    this.baseWindGrid = this.windGrid.map(row => row.map(cell => ({ u: cell.u, v: cell.v })));
-    console.log('[Elkwire] Atmospheric model with monsoon circulation initialized.');
-  }
-
-  /**
-   * Evolve the wind field between API calls using simplified atmospheric dynamics.
-   * Pressure systems drift, diurnal thermal cycle modulates monsoon, winds re-derived.
-   */
-  private evolveWindField() {
-    if (!this.dataReady || this.windGrid.length === 0) return;
-
-    const hour = new Date().getHours() + new Date().getMinutes() / 60;
-    // Diurnal factor: subtle modulation (±8%)
-    const diurnalFactor = 0.92 + 0.08 * Math.sin((hour - 6) * Math.PI / 12);
-    // Pressure drift: mid-latitude systems move east
-    const driftLon = 0.3;
-
-    // Use base wind as reference to prevent compounding
-    const ref = this.baseWindGrid.length > 0 ? this.baseWindGrid : this.windGrid;
-    const newGrid: { u: number, v: number }[][] = [];
-
-    for (let i = 0; i < this.gridRows; i++) {
-      const windRow: { u: number, v: number }[] = [];
-      const lat = 90 - i * (180 / (this.gridRows - 1));
-
-      for (let j = 0; j < this.gridCols; j++) {
-        const latFactor = Math.abs(lat) > 25 ? 1.0 : 0.2;
-        const srcJ = j - Math.round(driftLon / (360 / this.gridCols) * latFactor);
-        const wrappedJ = ((srcJ % this.gridCols) + this.gridCols) % this.gridCols;
-
-        const baseWind = ref[i][wrappedJ];
-        let u = baseWind.u * diurnalFactor;
-        let v = baseWind.v * diurnalFactor;
-
-        // Cap wind magnitude to prevent runaway
-        const mag = Math.sqrt(u * u + v * v);
-        if (mag > 4.0) {
-          u *= 4.0 / mag;
-          v *= 4.0 / mag;
-        }
-
-        windRow.push({ u, v });
-      }
-      newGrid.push(windRow);
-    }
-
-    this.windGrid = newGrid;
   }
 
   private initCanvas() {
@@ -353,6 +139,8 @@ export class App implements AfterViewInit, OnDestroy {
       height: this.height,
       centerLon: this.isMobileViewport ? this.proj?.centerLon ?? 0 : 30,
     });
+    this.flow = new FlowField(this.proj);
+    if (this.windSampler) this.flow.bakeAll(this.windSampler, this.terrain);
 
     const dpr = window.devicePixelRatio || 1;
     canvas.width = this.width * dpr;
@@ -449,27 +237,10 @@ export class App implements AfterViewInit, OnDestroy {
     let u = 0;
     let v = 0;
 
-    if (this.dataReady && this.windGrid.length === this.gridRows) {
-      // Convert canvas position to normalized grid position
-      // On mobile: canvas x maps to viewport longitude range
-      // On desktop: canvas x maps to full 360° range
-      const normX = Math.max(0, Math.min(1, x / (this.width || 1)));
-      const normY = Math.max(0, Math.min(1, y / (this.height || 1)));
-
-      const gx = normX * (this.gridCols - 1);
-      const gy = normY * (this.gridRows - 1);
-      const ix = Math.max(0, Math.min(Math.floor(gx), this.gridCols - 2));
-      const iy = Math.max(0, Math.min(Math.floor(gy), this.gridRows - 2));
-      const fx = gx - ix;
-      const fy = gy - iy;
-
-      const tl = this.windGrid[iy][ix];
-      const tr = this.windGrid[iy][ix + 1];
-      const bl = this.windGrid[iy + 1][ix];
-      const br = this.windGrid[iy + 1][ix + 1];
-
-      u = tl.u * (1 - fx) * (1 - fy) + tr.u * fx * (1 - fy) + bl.u * (1 - fx) * fy + br.u * fx * fy;
-      v = tl.v * (1 - fx) * (1 - fy) + tr.v * fx * (1 - fy) + bl.v * (1 - fx) * fy + br.v * fx * fy;
+    if (this.flow) {
+      this.flow.sample(x + this.proj.originX, y);
+      u = this.flow.sx;
+      v = this.flow.sy;
     }
 
     const windMag = Math.sqrt(u * u + v * v);
@@ -482,9 +253,7 @@ export class App implements AfterViewInit, OnDestroy {
 
   private renderLoop = () => {
     const now = performance.now();
-    const dt = Math.min(now - this.lastFrameTime, 50); // Cap at 50ms to prevent spiral
     this.lastFrameTime = now;
-    this.simElapsed += dt;
 
     // Smooth cursor follow
     if (this.mouse.targetX !== -1000) {
@@ -501,11 +270,13 @@ export class App implements AfterViewInit, OnDestroy {
       this.proj.panBy(App.PAN_PX_PER_FRAME_PER_PX_HEIGHT * this.height);
     }
 
-    // Evolve wind simulation every 60 seconds
-    if (this.simElapsed > 60000) {
-      this.simElapsed = 0;
-      this.evolveWindField();
+    // Re-blend the forecast frames against the real clock every 60 s (incremental, a few ms per frame).
+    if (this.windSampler && now - this.lastBake > 60000) {
+      this.lastBake = now;
+      this.windSampler.setTime(Date.now() / 1000);
+      this.flow?.begin(this.windSampler, this.terrain);
     }
+    this.flow?.step(1.5);
 
     // Faint clear for fluid trail effect
     this.ctx.fillStyle = 'rgba(0, 12, 24, 0.08)';
