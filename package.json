@@ -1,5 +1,5 @@
 {
-  "name": "ai-studio-angular-app",
+  "name": "elkwire-landing",
   "version": "0.0.0",
   "scripts": {
     "ng": "ng",
@@ -13,17 +13,14 @@
   },
   "private": true,
   "dependencies": {
-    "@angular/cdk": "^21.0.0",
     "@angular/common": "^21.0.0",
     "@angular/compiler": "^21.0.0",
     "@angular/core": "^21.0.0",
     "@angular/forms": "^21.0.0",
-    "@angular/material": "^21.0.0",
     "@angular/platform-browser": "^21.0.0",
     "@angular/platform-server": "^21.0.0",
     "@angular/router": "^21.0.0",
     "@angular/ssr": "^21.0.0",
-    "@google/genai": "^2.4.0",
     "express": "^5.1.0",
     "motion": "^12.23.24",
     "rxjs": "~7.8.0",
@@ -40,6 +37,8 @@
     "cross-env": "^10.1.0",
     "eslint": "^9.39.1",
     "jsdom": "^27.0.0",
+    "playwright": "^1.64.1",
+    "pngjs": "^7.0.0",
     "postcss": "^8.5.3",
     "tailwindcss": "^4.1.12",
     "typescript": "~5.9.2",
