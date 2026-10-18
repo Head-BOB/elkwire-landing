@@ -12,3 +12,6 @@ export function readArrayBuffer(rel: string): ArrayBuffer {
 export function readGunzipped(rel: string): Buffer {
   return gunzipSync(readFileSync(join(root, rel)));
 }
+
+/** Yielder for tests: never defer to the event loop. */
+export const noYield = (): Promise<void> => Promise.resolve();
