@@ -1,4 +1,6 @@
-import { ChangeDetectionStrategy, Component, ElementRef, ViewChild, AfterViewInit, OnDestroy, NgZone, HostListener } from '@angular/core';
+import { ChangeDetectionStrategy, Component, ElementRef, ViewChild, AfterViewInit, OnDestroy, NgZone, HostListener, inject } from '@angular/core';
+import { Projection } from './geo/projection';
+import { decodeLand, drawLandLayer, renderLandLayer, LandRings } from './geo/land';
 
 interface Particle {
   x: number;
@@ -24,7 +26,7 @@ interface Particle {
 export class App implements AfterViewInit, OnDestroy {
   @ViewChild('canvasElement') canvasRef!: ElementRef<HTMLCanvasElement>;
   private ctx!: CanvasRenderingContext2D;
-  private animationFrameId: number = 0;
+  private animationFrameId = 0;
   private particles: Particle[] = [];
   private mouse = { x: -1000, y: -1000, targetX: -1000, targetY: -1000 };
   private width = 0;
@@ -33,77 +35,25 @@ export class App implements AfterViewInit, OnDestroy {
   private gridCols = 13;
   private gridRows = 13;
 
-  private continentPaths: { x: number, y: number }[][] = [];
-  private mountainRanges: { x: number, y: number }[][] = [];
   private windRefreshTimer: ReturnType<typeof setInterval> | null = null;
   private pressureGrid: number[][] = [];
   private baseWindGrid: { u: number, v: number }[][] = []; // Reference for evolution
   private dataReady = false;
-  private deflectionPaths: { x: number, y: number }[][] = [];
-  private orographicBarriers: { points: { x: number, y: number }[], strength: number }[] = [];
-  private mapCache: HTMLCanvasElement | null = null;
-  private mapCacheDirty = true;
-  private terrainFieldU: Float32Array = new Float32Array(0);
-  private terrainFieldV: Float32Array = new Float32Array(0);
-  private tfCols = 0;
-  private tfRows = 0;
-  private tfCellSize = 20;
+  private proj!: Projection;
+  private landRings: LandRings = [];
+  private landLayer: HTMLCanvasElement | null = null;
   private isTouchDevice = false;
   // Mobile viewport: show portion of world, slowly scroll
   private isMobileViewport = false;
-  private viewportLon = 0; // Center longitude of viewport (degrees)
-  private viewportWidthDeg = 360; // Degrees of longitude visible
   // Simulation evolution
   private lastApiCall = 0;
   private simElapsed = 0;
   private lastFrameTime = 0;
 
-  // Real-world mountain range data: [lon, lat] polylines with relative strength
-  // Strength represents barrier height/effectiveness (1.0 = Himalayas-class)
-  private static readonly MOUNTAIN_DATA: { coords: number[][], strength: number }[] = [
-    // HIMALAYAS - highest, strongest wind barrier on Earth
-    { coords: [[72,37],[74,36],[76,35],[78,34],[80,32],[82,30],[84,29],[86,28],[88,27],[90,28],[92,27],[95,28],[97,27],[100,26]], strength: 1.0 },
-    // KARAKORAM / HINDU KUSH
-    { coords: [[67,36],[69,36],[71,37],[73,37],[75,36],[77,36]], strength: 0.85 },
-    // WESTERN GHATS (India) - blocks SW monsoon
-    { coords: [[73,21],[73.5,19],[74,17],[75,15],[75.5,13],[76,11],[77,9]], strength: 0.5 },
-    // ANDES - longest continental mountain range
-    { coords: [[-75,10],[-76,7],[-77,4],[-78,1],[-79,-2],[-78,-5],[-76,-10],[-72,-16],[-70,-20],[-70,-25],[-70,-30],[-71,-35],[-72,-40],[-73,-45],[-74,-50]], strength: 0.9 },
-    // ROCKY MOUNTAINS
-    { coords: [[-120,58],[-118,55],[-116,52],[-115,48],[-113,45],[-111,42],[-110,40],[-109,38],[-108,35],[-106,32],[-105,30]], strength: 0.75 },
-    // ALPS
-    { coords: [[5,46],[7,46.5],[8,47],[10,47],[12,47],[14,46.5],[16,46]], strength: 0.55 },
-    // URAL MOUNTAINS - Europe/Asia divide
-    { coords: [[58,50],[59,53],[60,56],[59,59],[58,62],[57,65],[56,68]], strength: 0.45 },
-    // ATLAS MOUNTAINS (North Africa)
-    { coords: [[-5,32],[-3,33],[-1,34],[1,34.5],[3,35],[5,36],[7,35],[9,35]], strength: 0.45 },
-    // GREAT DIVIDING RANGE (Australia)
-    { coords: [[149,-37],[150,-35],[151,-33],[152,-30],[151,-27],[150,-24],[149,-21],[148,-18],[146,-16]], strength: 0.4 },
-    // SCANDINAVIAN MOUNTAINS
-    { coords: [[5,59],[7,61],[9,63],[11,65],[13,67],[15,69],[17,70]], strength: 0.5 },
-    // CAUCASUS
-    { coords: [[37,43],[39,43],[41,42.5],[43,42],[45,42],[48,41]], strength: 0.55 },
-    // APPALACHIANS
-    { coords: [[-84,35],[-82,36],[-81,37],[-80,38],[-79,40],[-78,41],[-76,42],[-75,44]], strength: 0.35 },
-    // TIAN SHAN (Central Asia)
-    { coords: [[68,42],[71,42],[74,42],[77,43],[80,42]], strength: 0.7 },
-    // ALTAI MOUNTAINS
-    { coords: [[83,50],[85,49],[87,48],[89,48],[91,47]], strength: 0.5 },
-    // ETHIOPIAN HIGHLANDS
-    { coords: [[36,14],[37,12],[38,10],[39,8],[40,7]], strength: 0.45 },
-    // DRAKENSBERG (South Africa)
-    { coords: [[28,-29],[29,-30],[29.5,-31],[30,-32]], strength: 0.35 },
-    // ZAGROS MOUNTAINS (Iran)
-    { coords: [[46,37],[48,35],[50,33],[52,31],[54,29],[56,27]], strength: 0.55 },
-    // SIERRA MADRE (Mexico)
-    { coords: [[-107,28],[-106,26],[-105,24],[-104,22],[-103,20],[-102,18]], strength: 0.4 },
-    // CARPATHIANS
-    { coords: [[17,48],[19,49],[21,49],[23,48],[25,47],[26,46],[27,45]], strength: 0.4 },
-    // KUNLUN MOUNTAINS
-    { coords: [[74,36],[78,36],[82,36],[86,36],[90,36],[94,36]], strength: 0.7 },
-  ];
+  /** Mobile pan: 0.015 deg/frame on the old 180-deg-tall stretched map = 0.015/180 px per frame per px of height. */
+  private static readonly PAN_PX_PER_FRAME_PER_PX_HEIGHT = 0.015 / 180;
 
-  constructor(private ngZone: NgZone) {}
+  private ngZone = inject(NgZone);
 
   ngAfterViewInit() {
     this.isTouchDevice = 'ontouchstart' in window || navigator.maxTouchPoints > 0;
@@ -112,8 +62,7 @@ export class App implements AfterViewInit, OnDestroy {
     // API refresh: 2x per day instead of every 15min to avoid rate limits
     this.windRefreshTimer = setInterval(() => this.fetchRealtimeWinds(), 12 * 60 * 60 * 1000);
     this.initCanvas();
-    this.buildOrographicBarriers();
-    this.buildContinentPaths();
+    this.loadLand();
     this.animateText();
     this.lastFrameTime = performance.now();
   }
@@ -131,10 +80,7 @@ export class App implements AfterViewInit, OnDestroy {
   onResize() {
     this.isMobileViewport = this.isTouchDevice && window.innerWidth < 900;
     this.initCanvas();
-    this.buildOrographicBarriers();
-    if (this.rawPolygons.length > 0) {
-      this.projectContinents();
-    }
+    this.rebuildLandLayer();
   }
 
   @HostListener('window:mousemove', ['$event'])
@@ -401,14 +347,13 @@ export class App implements AfterViewInit, OnDestroy {
     this.width = window.innerWidth;
     this.height = window.innerHeight;
     
-    // Set mobile viewport dimensions
-    if (this.isMobileViewport) {
-      // Show longitude range proportional to aspect ratio (portrait shows ~120°)
-      this.viewportWidthDeg = Math.min(360, 180 * (this.width / this.height));
-    } else {
-      this.viewportWidthDeg = 360;
-    }
-    
+    // Desktop: static view centred on 30E. Mobile: starts at 0E and pans (see renderLoop).
+    this.proj = new Projection({
+      width: this.width,
+      height: this.height,
+      centerLon: this.isMobileViewport ? this.proj?.centerLon ?? 0 : 30,
+    });
+
     const dpr = window.devicePixelRatio || 1;
     canvas.width = this.width * dpr;
     canvas.height = this.height * dpr;
@@ -508,15 +453,7 @@ export class App implements AfterViewInit, OnDestroy {
       // Convert canvas position to normalized grid position
       // On mobile: canvas x maps to viewport longitude range
       // On desktop: canvas x maps to full 360° range
-      let normX: number;
-      if (this.isMobileViewport) {
-        // Canvas x → longitude → normalized grid position
-        const lon = this.viewportLon + ((x / this.width) - 0.5) * this.viewportWidthDeg;
-        // Wrap to [0, 360)
-        normX = (((lon + 180) % 360) + 360) % 360 / 360;
-      } else {
-        normX = Math.max(0, Math.min(1, x / (this.width || 1)));
-      }
+      const normX = Math.max(0, Math.min(1, x / (this.width || 1)));
       const normY = Math.max(0, Math.min(1, y / (this.height || 1)));
 
       const gx = normX * (this.gridCols - 1);
@@ -533,20 +470,6 @@ export class App implements AfterViewInit, OnDestroy {
 
       u = tl.u * (1 - fx) * (1 - fy) + tr.u * fx * (1 - fy) + bl.u * (1 - fx) * fy + br.u * fx * fy;
       v = tl.v * (1 - fx) * (1 - fy) + tr.v * fx * (1 - fy) + bl.v * (1 - fx) * fy + br.v * fx * fy;
-    }
-
-    // Terrain deflection (desktop only - mobile skips for perf)
-    if (!this.isMobileViewport && this.tfCols > 0 && this.tfRows > 0) {
-      const gx = Math.max(0, Math.min(this.tfCols - 1.001, x / this.tfCellSize));
-      const gy = Math.max(0, Math.min(this.tfRows - 1.001, y / this.tfCellSize));
-      const ix = Math.floor(gx), iy = Math.floor(gy);
-      const fx = gx - ix, fy = gy - iy;
-      const ix1 = Math.min(ix + 1, this.tfCols - 1);
-      const iy1 = Math.min(iy + 1, this.tfRows - 1);
-      const i00 = iy * this.tfCols + ix, i10 = iy * this.tfCols + ix1;
-      const i01 = iy1 * this.tfCols + ix, i11 = iy1 * this.tfCols + ix1;
-      u += this.terrainFieldU[i00] * (1-fx)*(1-fy) + this.terrainFieldU[i10] * fx*(1-fy) + this.terrainFieldU[i01] * (1-fx)*fy + this.terrainFieldU[i11] * fx*fy;
-      v += this.terrainFieldV[i00] * (1-fx)*(1-fy) + this.terrainFieldV[i10] * fx*(1-fy) + this.terrainFieldV[i01] * (1-fx)*fy + this.terrainFieldV[i11] * fx*fy;
     }
 
     const windMag = Math.sqrt(u * u + v * v);
@@ -574,8 +497,8 @@ export class App implements AfterViewInit, OnDestroy {
 
     // Mobile: slowly pan viewport east→west (Earth rotation)
     if (this.isMobileViewport) {
-      this.viewportLon += 0.015; // ~5.4°/min → full rotation in ~67 min
-      if (this.viewportLon > 180) this.viewportLon -= 360;
+      // Same on-screen pan speed as before (0.015 deg/frame of the old 180-deg-tall map).
+      this.proj.panBy(App.PAN_PX_PER_FRAME_PER_PX_HEIGHT * this.height);
     }
 
     // Evolve wind simulation every 60 seconds
@@ -588,17 +511,12 @@ export class App implements AfterViewInit, OnDestroy {
     this.ctx.fillStyle = 'rgba(0, 12, 24, 0.08)';
     this.ctx.fillRect(0, 0, this.width, this.height);
 
-    // Draw continent silhouettes
-    if (this.isMobileViewport) {
-      this.drawContinentsDirect(); // Direct draw (viewport changes each frame)
-    } else {
-      this.drawContinents(); // Cached (static viewport)
-    }
+    // Draw continent silhouettes (cached world strip, blitted at the pan offset)
+    if (this.landLayer) drawLandLayer(this.ctx, this.landLayer, this.proj);
 
     const t = now * 0.00005;
 
-    for (let i = 0; i < this.particles.length; i++) {
-      const p = this.particles[i];
+    for (const p of this.particles) {
       p.color = p.baseColor;
 
       const fluid = this.getFluidVelocity(p.x, p.y, t);
@@ -630,7 +548,7 @@ export class App implements AfterViewInit, OnDestroy {
 
       // Mobile: shift particle screen coordinates to stay locked to the panning world
       if (this.isMobileViewport) {
-        const panShiftPx = (0.015 / this.viewportWidthDeg) * this.width;
+        const panShiftPx = App.PAN_PX_PER_FRAME_PER_PX_HEIGHT * this.height;
         p.x -= panShiftPx;
         p.lastX -= panShiftPx;
         
@@ -689,266 +607,20 @@ export class App implements AfterViewInit, OnDestroy {
 
   // --- MAP FEATURE ---
 
-  private lonLatToCanvas(lon: number, lat: number): { x: number, y: number } {
-    let x: number;
-    if (this.isMobileViewport) {
-      let relLon = lon - this.viewportLon;
-      while (relLon > 180) relLon -= 360;
-      while (relLon < -180) relLon += 360;
-      x = ((relLon / this.viewportWidthDeg) + 0.5) * this.width;
-    } else {
-      x = ((lon + 180) / 360) * this.width;
-    }
-    const y = ((90 - lat) / 180) * this.height;
-    return { x, y };
-  }
-
-  private rawPolygons: number[][][] = [];
-
-  private async buildContinentPaths() {
+  private async loadLand() {
     try {
-      if (this.rawPolygons.length === 0) {
-        const response = await fetch('https://cdn.jsdelivr.net/npm/world-atlas@2/land-110m.json');
-        const topo = await response.json();
-        this.rawPolygons = this.decodeTopoJSON(topo);
-      }
-      this.projectContinents();
+      const response = await fetch('/data/land.bin');
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      this.landRings = decodeLand(await response.arrayBuffer());
+      this.rebuildLandLayer();
     } catch (e) {
-      console.warn('[Elkwire] Failed to fetch coastline data, map feature unavailable.', e);
-      this.continentPaths = [];
-      this.deflectionPaths = [];
-      this.mountainRanges = [];
+      console.warn('[Elkwire] Failed to load land data, map feature unavailable.', e);
     }
   }
 
-  private projectContinents() {
-    this.continentPaths = this.rawPolygons.map(poly =>
-      poly.map(([lon, lat]) => this.lonLatToCanvas(lon, lat))
-    );
-
-    this.deflectionPaths = this.continentPaths.map(path => {
-      if (path.length <= 20) return path;
-      const step = Math.max(1, Math.floor(path.length / 40));
-      const sampled: { x: number, y: number }[] = [];
-      for (let i = 0; i < path.length; i += step) sampled.push(path[i]);
-      return sampled;
-    });
-
-    this.mountainRanges = [];
-    this.buildTerrainField();
-    this.mapCacheDirty = true;
-  }
-
-  private buildTerrainField() {
-    if (!this.width || !this.height) return;
-    this.tfCols = Math.ceil(this.width / this.tfCellSize) + 1;
-    this.tfRows = Math.ceil(this.height / this.tfCellSize) + 1;
-    const len = this.tfCols * this.tfRows;
-    this.terrainFieldU = new Float32Array(len);
-    this.terrainFieldV = new Float32Array(len);
-    
-    for (let y = 0; y < this.tfRows; y++) {
-      for (let x = 0; x < this.tfCols; x++) {
-        const px = x * this.tfCellSize;
-        const py = y * this.tfCellSize;
-        let du = 0, dv = 0;
-
-        // Coastline deflection
-        let closestCoast = Infinity;
-        let cx = 0, cy = 0;
-        for (const path of this.deflectionPaths) {
-          for (let i = 0; i < path.length - 1; i++) {
-            const ax = path[i].x, ay = path[i].y;
-            const bx = path[i + 1].x, by = path[i + 1].y;
-            const abx = bx - ax, aby = by - ay;
-            const apx = px - ax, apy = py - ay;
-            const len2 = abx * abx + aby * aby;
-            if (len2 === 0) continue;
-            const t = Math.max(0, Math.min(1, (apx * abx + apy * aby) / len2));
-            const nx = ax + t * abx, ny = ay + t * aby;
-            const dx = px - nx, dy = py - ny;
-            const dist = Math.sqrt(dx * dx + dy * dy);
-            if (dist < closestCoast && dist < 20) {
-              closestCoast = dist;
-              const dl = dist || 1;
-              cx = dx / dl;
-              cy = dy / dl;
-            }
-          }
-        }
-        if (closestCoast < 20) {
-          const force = Math.pow((20 - closestCoast) / 20, 2) * 2;
-          du += cx * force + (-cy) * force * 0.4;
-          dv += cy * force + cx * force * 0.4;
-        }
-
-        // Orographic deflection
-        let closestMtn = Infinity;
-        let mx = 0, my = 0;
-        let mStr = 0;
-        for (const barrier of this.orographicBarriers) {
-          for (let i = 0; i < barrier.points.length - 1; i++) {
-            const ax = barrier.points[i].x, ay = barrier.points[i].y;
-            const bx = barrier.points[i + 1].x, by = barrier.points[i + 1].y;
-            const abx = bx - ax, aby = by - ay;
-            const apx = px - ax, apy = py - ay;
-            const len2 = abx * abx + aby * aby;
-            if (len2 === 0) continue;
-            const t = Math.max(0, Math.min(1, (apx * abx + apy * aby) / len2));
-            const nx = ax + t * abx, ny = ay + t * aby;
-            const dx = px - nx, dy = py - ny;
-            const dist = Math.sqrt(dx * dx + dy * dy);
-            if (dist < closestMtn && dist < 30) {
-              closestMtn = dist;
-              const dl = dist || 1;
-              mx = dx / dl;
-              my = dy / dl;
-              mStr = barrier.strength;
-            }
-          }
-        }
-        if (closestMtn < 30) {
-          const proximity = (30 - closestMtn) / 30;
-          const force = proximity * proximity * mStr * 3;
-          du += mx * force * 0.6 + (-my) * force * 0.8;
-          dv += my * force * 0.6 + mx * force * 0.8;
-        }
-
-        const idx = y * this.tfCols + x;
-        this.terrainFieldU[idx] = du;
-        this.terrainFieldV[idx] = dv;
-      }
-    }
-  }
-
-  private updateMapCache() {
-    if (!this.mapCache) {
-      this.mapCache = document.createElement('canvas');
-    }
-    this.mapCache.width = this.width;
-    this.mapCache.height = this.height;
-    const ctx = this.mapCache.getContext('2d');
-    if (!ctx) return;
-
-    ctx.clearRect(0, 0, this.width, this.height);
-
-    for (const path of this.continentPaths) {
-      if (path.length < 3) continue;
-      ctx.beginPath();
-      ctx.moveTo(path[0].x, path[0].y);
-      for (let i = 1; i < path.length; i++) {
-        ctx.lineTo(path[i].x, path[i].y);
-      }
-      ctx.closePath();
-      ctx.fillStyle = 'rgba(0, 4, 10, 0.04)';
-      ctx.fill();
-    }
-
-    this.mapCacheDirty = false;
-  }
-
-  private drawContinents() {
-    if (this.mapCacheDirty) {
-      this.updateMapCache();
-    }
-    if (this.mapCache) {
-      this.ctx.drawImage(this.mapCache, 0, 0);
-    }
-  }
-
-  /**
-   * Draw continents directly for mobile viewport (no cache, re-projects each frame).
-   * Only draws polygons that are within the visible viewport.
-   */
-  private drawContinentsDirect() {
-    if (this.rawPolygons.length === 0) return;
-    const halfW = this.viewportWidthDeg / 2;
-
-    for (const poly of this.rawPolygons) {
-      if (poly.length < 3) continue;
-
-      // Quick visibility check: skip polygons entirely outside viewport
-      let anyVisible = false;
-      for (let k = 0; k < poly.length; k += Math.max(1, Math.floor(poly.length / 8))) {
-        let relLon = poly[k][0] - this.viewportLon;
-        while (relLon > 180) relLon -= 360;
-        while (relLon < -180) relLon += 360;
-        if (Math.abs(relLon) < halfW + 20) { anyVisible = true; break; }
-      }
-      if (!anyVisible) continue;
-
-      this.ctx.beginPath();
-      const p0 = this.lonLatToCanvas(poly[0][0], poly[0][1]);
-      this.ctx.moveTo(p0.x, p0.y);
-      for (let i = 1; i < poly.length; i++) {
-        const pt = this.lonLatToCanvas(poly[i][0], poly[i][1]);
-        this.ctx.lineTo(pt.x, pt.y);
-      }
-      this.ctx.closePath();
-      this.ctx.fillStyle = 'rgba(0, 4, 10, 0.04)';
-      this.ctx.fill();
-    }
-  }
-
-  /**
-   * Decode TopoJSON land-110m format into arrays of [lon, lat] coordinate rings.
-   * Handles delta-encoded arcs with quantization transform.
-   */
-  private decodeTopoJSON(topo: any): number[][][] {
-    const rawArcs: number[][][] = topo.arcs;
-    const transform = topo.transform;
-    const sx = transform.scale[0], sy = transform.scale[1];
-    const tx = transform.translate[0], ty = transform.translate[1];
-
-    const decodedArcs: number[][][] = rawArcs.map((arc: number[][]) => {
-      let x = 0, y = 0;
-      return arc.map((pt: number[]) => {
-        x += pt[0];
-        y += pt[1];
-        return [x * sx + tx, y * sy + ty];
-      });
-    });
-
-    const resolveArc = (idx: number): number[][] => {
-      if (idx >= 0) return decodedArcs[idx];
-      return [...decodedArcs[~idx]].reverse();
-    };
-
-    const stitchRing = (ring: number[]): number[][] => {
-      const coords: number[][] = [];
-      for (const idx of ring) {
-        const arc = resolveArc(idx);
-        for (let i = coords.length > 0 ? 1 : 0; i < arc.length; i++) {
-          coords.push(arc[i]);
-        }
-      }
-      return coords;
-    };
-
-    const polygons: number[][][] = [];
-    const landObj = topo.objects.land;
-
-    const processGeometry = (geom: any) => {
-      if (geom.type === 'Polygon') {
-        polygons.push(stitchRing(geom.arcs[0]));
-      } else if (geom.type === 'MultiPolygon') {
-        for (const polygon of geom.arcs) {
-          polygons.push(stitchRing(polygon[0]));
-        }
-      } else if (geom.type === 'GeometryCollection') {
-        for (const g of geom.geometries) processGeometry(g);
-      }
-    };
-
-    processGeometry(landObj);
-    return polygons;
-  }
-
-  private buildOrographicBarriers() {
-    this.orographicBarriers = App.MOUNTAIN_DATA.map(m => ({
-      points: m.coords.map(([lon, lat]) => this.lonLatToCanvas(lon, lat)),
-      strength: m.strength
-    }));
+  private rebuildLandLayer() {
+    if (this.landRings.length === 0) return;
+    this.landLayer ??= document.createElement('canvas');
+    renderLandLayer(this.landRings, this.proj, this.landLayer);
   }
 }
-

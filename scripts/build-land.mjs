@@ -7,7 +7,7 @@
 // that is really the pole closing edge.
 //
 // Output convention: every ring has CONTINUOUS longitude (unwrapped, may extend slightly past +-180)
-// so no segment ever spans more than 180 deg. A ring that winds once around the pole is closed
+// so no segment ever spans more than 180 deg (each ring is centred into [-180, 180) by whole turns). A ring that winds once around the pole is closed
 // explicitly along lat -90. The renderer draws copies at k * 360 deg. Lattice integers are stored
 // losslessly as zigzag-varint deltas.
 //
@@ -36,6 +36,15 @@ function unwrap(ring) {
     else if (d < -180) shift += 360;
     out.push([ring[i][0] + shift, ring[i][1]]);
   }
+  // Re-centre by a whole number of revolutions so the ring's middle longitude is in [-180, 180).
+  let min = Infinity;
+  let max = -Infinity;
+  for (const [x] of out) {
+    if (x < min) min = x;
+    if (x > max) max = x;
+  }
+  const turns = Math.floor(((min + max) / 2 + 180) / 360);
+  if (turns !== 0) for (const p of out) p[0] -= turns * 360;
   return out;
 }
 
@@ -63,8 +72,11 @@ for (const g of geoms) {
         const south = r.reduce((a, p) => a + p[1], 0) / r.length < 0;
         const poleLat = south ? -90 : 90;
         if (Math.abs(Math.abs(net) - 360) > 1) throw new Error(`unexpected winding ${net}`);
-        // Midpoint keeps every segment <= 180 deg (the pole edge spans one full world width).
-        r.push([last[0], poleLat], [(last[0] + first[0]) / 2, poleLat], [first[0], poleLat]);
+        // The pole edge spans one full world width; quarter points keep every segment <= 90 deg even
+        // after lattice rounding.
+        r.push([last[0], poleLat]);
+        for (let q = 1; q < 4; q++) r.push([last[0] + ((first[0] - last[0]) * q) / 4, poleLat]);
+        r.push([first[0], poleLat]);
         polarRings++;
       }
       // Drop the duplicated closing vertex; the renderer closes the path.
